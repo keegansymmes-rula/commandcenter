@@ -230,15 +230,29 @@ describe("connection_error status and supervisor notice", () => {
     if (originalPearlName === undefined) delete process.env.PEARL_NAME;
     else process.env.PEARL_NAME = originalPearlName;
     vi.doUnmock("node:child_process");
+    vi.doUnmock("node:fs");
     vi.useRealTimers();
     vi.resetModules();
   });
 
   // Fresh module with tmux stubbed: the job's pane is captured with `-S -`,
   // the supervisor's without it. Fake timers keep the module's own poll
-  // interval from firing against the stub.
-  async function load() {
+  // interval from firing against the stub. `failMarkerWrite` makes the
+  // notice marker file unwritable, like a removed jobs dir or a full disk.
+  async function load({ failMarkerWrite = false } = {}) {
     process.env.PEARL_NAME = "Pearl";
+    if (failMarkerWrite) {
+      vi.doMock("node:fs", async (importOriginal) => {
+        const actual = await importOriginal();
+        return {
+          ...actual,
+          writeFileSync: (path, ...rest) => {
+            if (String(path).endsWith(".connection-error")) throw new Error("ENOSPC");
+            return actual.writeFileSync(path, ...rest);
+          },
+        };
+      });
+    }
     jobPane = healthyPane;
     supervisorPane = box();
     sent = [];
@@ -378,8 +392,44 @@ describe("connection_error status and supervisor notice", () => {
     // A restarted server re-adopts the job with no in-memory state.
     job.status = "running";
     job.noticeAttempts = undefined;
+    job.noticeDone = undefined;
     t.pollRunningJobs();
     expect(sent).toHaveLength(1);
+  });
+
+  it("sends only one notice when the marker file cannot be written", async () => {
+    const t = await load({ failMarkerWrite: true });
+    addJob(t);
+    jobPane = erroredPane;
+    t.pollRunningJobs();
+    t.pollRunningJobs();
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+  });
+
+  it("stops retrying at the attempt cap even when the marker file cannot be written", async () => {
+    const t = await load({ failMarkerWrite: true });
+    addJob(t);
+    jobPane = erroredPane;
+    supervisorPane = "Do you want to proceed?\n❯ 1. Yes";
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    for (let i = 0; i < t.NOTICE_MAX_ATTEMPTS + 10; i += 1) t.pollRunningJobs();
+
+    expect(supervisorCaptures).toBe(t.NOTICE_MAX_ATTEMPTS);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+
+  it("announces a second occurrence after recovery even when the marker file cannot be written", async () => {
+    const t = await load({ failMarkerWrite: true });
+    addJob(t);
+    jobPane = erroredPane;
+    t.pollRunningJobs();
+    jobPane = healthyPane;
+    t.pollRunningJobs();
+    jobPane = erroredPane;
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(2);
   });
 
   it("keeps a connection_error job counted as live for its ticket", async () => {
@@ -422,8 +472,15 @@ describe("connection_error status and supervisor notice", () => {
   it("does not expose poller bookkeeping through serializeJob", async () => {
     await load();
     const mod = await import("../api/run-command.js");
-    const out = mod.serializeJob({ id: "abc", status: "connection_error", noticeAttempts: 3, log: "" });
+    const out = mod.serializeJob({
+      id: "abc",
+      status: "connection_error",
+      noticeAttempts: 3,
+      noticeDone: true,
+      log: "",
+    });
     expect(out).not.toHaveProperty("noticeAttempts");
+    expect(out).not.toHaveProperty("noticeDone");
     expect(out.status).toBe("connection_error");
   });
 });

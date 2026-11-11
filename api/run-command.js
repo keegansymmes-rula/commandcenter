@@ -271,14 +271,18 @@ function sendNoticeToSupervisor(text) {
   }
 }
 
-// One notice per occurrence: the marker file is written once the supervisor
-// has been told (or we gave up) and removed as soon as the job leaves
-// connection_error, so a later, separate error announces itself again.
+// One notice per occurrence: once the supervisor has been told (or we gave
+// up) that is recorded on the job and in the marker file, and both are
+// cleared as soon as the job leaves connection_error, so a later, separate
+// error announces itself again. The in-memory flag is what holds if the
+// marker cannot be written (jobs dir gone, disk full); the file only carries
+// the state across an API restart.
 function trackConnectionError(job) {
   const marker = connectionErrorMarkerPath(job.id);
 
   if (job.status !== "connection_error") {
     job.noticeAttempts = 0;
+    job.noticeDone = false;
     // existsSync first: this runs for every live job on every poll, and
     // almost always there is nothing to remove.
     if (existsSync(marker)) {
@@ -291,14 +295,19 @@ function trackConnectionError(job) {
     return;
   }
 
-  if (existsSync(marker)) return;
+  if (job.noticeDone || existsSync(marker)) {
+    job.noticeDone = true;
+    return;
+  }
 
   job.noticeAttempts = (job.noticeAttempts ?? 0) + 1;
   const deliverable = SAFE_ID.test(job.id);
   if (deliverable && sendNoticeToSupervisor(connectionErrorNotice(job))) {
+    job.noticeDone = true;
     writeMarker(marker, "notified");
   } else if (!deliverable || job.noticeAttempts >= NOTICE_MAX_ATTEMPTS) {
     console.warn(`connection_error notice for job ${job.id} not delivered; giving up`);
+    job.noticeDone = true;
     writeMarker(marker, "gave up");
   }
 }
@@ -307,8 +316,8 @@ function writeMarker(path, content) {
   try {
     writeFileSync(path, `${content} ${new Date().toISOString()}\n`, "utf-8");
   } catch {
-    // Without a marker the notice may repeat after a restart; not worth
-    // failing the poll over.
+    // Dedupe across an API restart is lost; within this process the job's
+    // noticeDone flag still holds. Not worth failing the poll over.
   }
 }
 
@@ -433,8 +442,9 @@ export function startCommandJob({
 // agent actually wrote to it, not whether one exists.
 export function serializeJob(job, { includeLog = false } = {}) {
   if (!job) return null;
-  // noticeAttempts is poller bookkeeping, not part of the job's API shape.
-  const { log, noticeAttempts, ...rest } = job;
+  // noticeAttempts / noticeDone are poller bookkeeping, not part of the job's
+  // API shape.
+  const { log, noticeAttempts, noticeDone, ...rest } = job;
   const withBrain = { ...rest, hasBrain: hasBrainContent(job.id) };
   return includeLog ? { ...withBrain, log } : withBrain;
 }

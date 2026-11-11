@@ -87,6 +87,55 @@ describe("endsInConnectionError", () => {
     expect(endsInConnectionError(text)).toBe(false);
   });
 
+  it("matches an error word-wrapped across rows in a narrow pane", () => {
+    const text = pane(
+      "  ⎿  API Error: Connection lost",
+      "     mid-response. The response above",
+      "     may be incomplete.",
+    );
+    expect(endsInConnectionError(text)).toBe(true);
+  });
+
+  it("matches an error split inside a word by a hard terminal wrap", () => {
+    const text = pane("  ⎿  API Error: Connection lost mid-resp", "onse. The response above may be");
+    expect(endsInConnectionError(text)).toBe(true);
+  });
+
+  it("still sees a wrapped error as superseded by later output", () => {
+    const text = pane(
+      "  ⎿  API Error: Connection lost",
+      "     mid-response.",
+      "❯ continue",
+      "⏺ Picking back up",
+    );
+    expect(endsInConnectionError(text)).toBe(false);
+  });
+
+  it("stays true while a multi-row draft is typed in the box", () => {
+    const text = [
+      ERROR_LINE,
+      "",
+      BORDER,
+      "❯ a long unsent draft that wraps onto",
+      "  a second row of the input box",
+      BORDER,
+      "  ⏵⏵ auto mode on (shift+tab to cycle)",
+    ].join("\n");
+    expect(endsInConnectionError(text)).toBe(true);
+  });
+
+  it("does not read a draft's continuation rows as new output", () => {
+    const text = [
+      ERROR_LINE,
+      BORDER,
+      "❯ continue, and then",
+      "> second line of my draft",
+      "  third line",
+      BORDER,
+    ].join("\n");
+    expect(endsInConnectionError(text)).toBe(true);
+  });
+
   it("handles a huge scrollback without scanning all of it", () => {
     const text = `${"filler line\n".repeat(200_000)}${pane(ERROR_LINE)}`;
     expect(endsInConnectionError(text)).toBe(true);
@@ -105,11 +154,21 @@ describe("chatPromptIsEmpty", () => {
   it("is false when there is no framed prompt at all", () => {
     expect(chatPromptIsEmpty("Do you want to proceed?\n❯ 1. Yes")).toBe(false);
   });
+
+  it("is false when a draft has text only on a continuation row", () => {
+    const text = [BORDER, "❯", "  text on the second row", BORDER].join("\n");
+    expect(chatPromptIsEmpty(text)).toBe(false);
+  });
 });
 
 describe("isAtChatPrompt (shared with pearl-speak)", () => {
   it("matches the framed prompt and rejects a bare menu cursor", () => {
     expect(isAtChatPrompt(inputBox().join("\n"))).toBe(true);
     expect(isAtChatPrompt("Do you want to proceed?\n❯ 1. Yes\n  2. No")).toBe(false);
+  });
+
+  it("rejects a multi-row draft, so nothing is typed into it", () => {
+    const text = [BORDER, "❯ first row", "  second row", BORDER].join("\n");
+    expect(isAtChatPrompt(text)).toBe(false);
   });
 });
