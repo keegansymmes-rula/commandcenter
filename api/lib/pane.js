@@ -41,17 +41,35 @@ export function chatPromptIsEmpty(paneText) {
 
 export const CONNECTION_ERROR_TEXT = "API Error: Connection lost mid-response";
 
+// The wording of Claude Code's permission and confirmation dialogs ("Do you
+// want to proceed?"). Shared with run-command.js's needs_input check so both
+// agree on what a dialog looks like.
+export const DIALOG_QUESTION = /Do you want to [^\n?]*\?/;
+
+// What is verified and what is inferred. Verified from real session
+// transcripts (seven isApiErrorMessage entries): the error is a synthetic
+// assistant message whose whole text is "API Error: Connection lost
+// mid-response. The response above may be incomplete." Inferred, because no
+// raw tmux capture of it exists to check against: the TUI draws it as its own
+// `⎿ `-prefixed row, the shape the other API errors take. So the match is the
+// error opening a `⎿` row and followed straight away by a period. A reply that
+// quotes it ("...Connection lost mid-response" in quotes or backticks) starts
+// its row with `⏺`/`●` or indentation, never `⎿`, and ends the phrase with a
+// quote, not a period. A tool's output also hangs off `⎿`, but only as the
+// first row under its `⏺ Tool(...)` header, so that spot is excluded.
+//
 // Tolerates the error being broken across rows: the TUI word-wraps at spaces
 // (and indents continuation rows), and a narrow terminal can split inside a
 // word. Optional whitespace, newlines included, between every character
 // covers both. Linear, since each `\s*` is followed by a non-space literal.
-const CONNECTION_ERROR_PATTERN = new RegExp(
-  [...CONNECTION_ERROR_TEXT]
-    .filter((ch) => ch !== " ")
-    .map((ch) => ch.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&"))
-    .join("\\s*"),
-  "g",
-);
+const WRAP_TOLERANT_ERROR = [...`${CONNECTION_ERROR_TEXT}.`]
+  .filter((ch) => ch !== " ")
+  .map((ch) => ch.replace(/[.*+?^${}()|[\]\\-]/g, "\\$&"))
+  .join("\\s*");
+const CONNECTION_ERROR_PATTERN = new RegExp(`^[ \\t]*⎿[ \\t]*${WRAP_TOLERANT_ERROR}`, "gm");
+// `⏺ Bash(...)` / `● Read(...)`: a tool-call header, whose first `⎿` row is
+// that tool's output, not a status line of the session itself.
+const TOOL_CALL_HEADER = /^\s*(?:⏺|●)\s+[\w.:-]+\(/;
 
 // Only the pane's tail is examined: this runs on every poll for every live
 // job, and the whole scrollback (up to 100k+ chars) is irrelevant to whether
@@ -68,29 +86,35 @@ const SUPERSEDED = /^\s*(?:❯|>|⏺|●)(?:\s|$)/;
 // retrying on its own is not stuck.
 const WORKING = "esc to interrupt";
 
-// Index, into `shown`, of the row the last occurrence of the error ends on, or
-// -1. Matching runs on the rows joined with newlines so a wrapped error still
-// matches, then the match end is mapped back to its row.
+// Index, into `shown`, of the row the last valid occurrence of the error ends
+// on, or -1. Matching runs on the rows joined with newlines so a wrapped error
+// still matches, then the match offsets are mapped back to rows.
 function lastErrorRow(shown) {
   const flat = shown.join("\n");
-  let end = -1;
-  for (const match of flat.matchAll(CONNECTION_ERROR_PATTERN)) {
-    end = match.index + match[0].length;
-  }
-  if (end === -1) return -1;
+  const rowAt = (offset) => {
+    let rowStart = 0;
+    for (let row = 0; row < shown.length; row += 1) {
+      const rowEnd = rowStart + shown[row].length;
+      if (offset <= rowEnd) return row;
+      rowStart = rowEnd + 1;
+    }
+    return -1;
+  };
 
-  let rowStart = 0;
-  for (let row = 0; row < shown.length; row += 1) {
-    const rowEnd = rowStart + shown[row].length;
-    if (end <= rowEnd) return row;
-    rowStart = rowEnd + 1;
+  let found = -1;
+  for (const match of flat.matchAll(CONNECTION_ERROR_PATTERN)) {
+    const start = rowAt(match.index);
+    if (start > 0 && TOOL_CALL_HEADER.test(shown[start - 1])) continue;
+    found = rowAt(match.index + match[0].length);
   }
-  return -1;
+  return found;
 }
 
 // True when the pane's latest state is the connection-lost error: the text is
-// above the input box, nothing has superseded it, and no turn is running. An
-// older occurrence the agent recovered from fails the "nothing after it" test.
+// above the input box, nothing has superseded it (a follow-up, new output, or
+// a dialog), and no turn is running. An older occurrence the agent recovered
+// from fails the "nothing after it" test. Callers can therefore treat a true
+// result as "newer than anything else in the pane", including an old dialog.
 export function endsInConnectionError(paneText) {
   const lines = paneText.slice(-TAIL_CHARS).split("\n");
   const block = inputBlock(lines);
@@ -106,6 +130,6 @@ export function endsInConnectionError(paneText) {
 
   const after = shown.slice(errorRow + 1);
   if (after.length > MAX_LINES_AFTER_ERROR) return false;
-  if (after.some((line) => SUPERSEDED.test(line))) return false;
+  if (after.some((line) => SUPERSEDED.test(line) || DIALOG_QUESTION.test(line))) return false;
   return ![...after, ...footer].some((line) => line.includes(WORKING));
 }

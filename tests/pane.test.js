@@ -140,6 +140,86 @@ describe("endsInConnectionError", () => {
     const text = `${"filler line\n".repeat(200_000)}${pane(ERROR_LINE)}`;
     expect(endsInConnectionError(text)).toBe(true);
   });
+
+  describe("text that merely quotes the error", () => {
+    it("is false when an assistant reply quotes it inline", () => {
+      const text = pane(
+        '⏺ The pane ends in "API Error: Connection lost mid-response" when the stream drops,',
+        "  so the detector looks for that line.",
+      );
+      expect(endsInConnectionError(text)).toBe(false);
+    });
+
+    it("is false when a reply quotes it with a trailing period inside prose", () => {
+      const text = pane("⏺ We flag API Error: Connection lost mid-response. That is the trigger.");
+      expect(endsInConnectionError(text)).toBe(false);
+    });
+
+    it("is false when a wrapped reply happens to start a row with the text", () => {
+      const text = pane(
+        "⏺ When the stream drops the pane shows",
+        "  API Error: Connection lost mid-response. The response above may be incomplete.",
+      );
+      expect(endsInConnectionError(text)).toBe(false);
+    });
+
+    it("is false when it sits in a code block in a reply", () => {
+      const text = pane(
+        "⏺ The fixture looks like this:",
+        "",
+        "    const ERROR = 'API Error: Connection lost mid-response. The response above';",
+        "",
+        "  That is all the matcher needs.",
+      );
+      expect(endsInConnectionError(text)).toBe(false);
+    });
+
+    it("is false when it is the first line of a tool's output", () => {
+      const text = pane(
+        '⏺ Bash(echo "API Error: Connection lost mid-response. The response above may be incomplete.")',
+        "  ⎿  API Error: Connection lost mid-response. The response above may be incomplete.",
+      );
+      expect(endsInConnectionError(text)).toBe(false);
+    });
+
+    it("is false when it shows up in a tool call's own header", () => {
+      const text = pane('⏺ Grep("API Error: Connection lost mid-response")', "  ⎿  Found 3 lines");
+      expect(endsInConnectionError(text)).toBe(false);
+    });
+
+    it("is still true for the real error after such a quote", () => {
+      const text = pane(
+        '⏺ We flag "API Error: Connection lost mid-response" as a stuck session.',
+        "",
+        ERROR_LINE,
+      );
+      expect(endsInConnectionError(text)).toBe(true);
+    });
+
+    it("is true for the real error right after a tool's output", () => {
+      const text = pane("⏺ Read(api/x.js)", "  ⎿  Read 40 lines", "", ERROR_LINE);
+      expect(endsInConnectionError(text)).toBe(true);
+    });
+  });
+
+  describe("a dialog against the error, whichever is newer", () => {
+    const DIALOG = ["Do you want to proceed?", "❯ 1. Yes", "  2. No"];
+
+    it("is false when a dialog is newer than the error", () => {
+      expect(endsInConnectionError([ERROR_LINE, "", ...DIALOG].join("\n"))).toBe(false);
+    });
+
+    it("is false when a newer dialog's question has no menu cursor", () => {
+      expect(endsInConnectionError([ERROR_LINE, "Do you want to continue? (y/n)"].join("\n"))).toBe(
+        false,
+      );
+    });
+
+    it("is true when the error is newer than an old dialog still on screen", () => {
+      const text = [...DIALOG, "⏺ Ran the command", ERROR_LINE, "", ...inputBox()].join("\n");
+      expect(endsInConnectionError(text)).toBe(true);
+    });
+  });
 });
 
 describe("chatPromptIsEmpty", () => {

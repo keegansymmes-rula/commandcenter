@@ -26,6 +26,7 @@ import { join } from "node:path";
 import { hasBrainContent } from "./brain.js";
 import {
   CONNECTION_ERROR_TEXT,
+  DIALOG_QUESTION,
   chatPromptIsEmpty,
   endsInConnectionError,
   isAtChatPrompt,
@@ -69,12 +70,11 @@ function truncate(text) {
 // the binary, not guessed) is the more general signal on top of it — any
 // numbered choice sitting there with a selection cursor on it means
 // something is waiting on a keypress, independent of the exact wording.
-const NEEDS_INPUT_QUESTION = /Do you want to [^\n?]*\?/;
 const NEEDS_INPUT_MENU_CURSOR = /^\s*❯\s*\d+\./m;
 
 function needsInput(paneText) {
   const tail = paneText.slice(-2000);
-  if (NEEDS_INPUT_QUESTION.test(tail)) return true;
+  if (DIALOG_QUESTION.test(tail)) return true;
   return NEEDS_INPUT_MENU_CURSOR.test(tail);
 }
 
@@ -82,9 +82,11 @@ function needsInput(paneText) {
 // the turn and leaves the agent idle at its prompt: no exit code, no
 // permission dialog, and the agent never reports because it believes it is
 // waiting for the user. It is a status of its own (not a flag on "running")
-// because every consumer already branches on status, and it cannot overlap
-// needs_input: the pane is at an idle input box, not a dialog. The text
-// matching and "is it still the latest state" rules live in lib/pane.js.
+// because every consumer already branches on status. needsInput() above looks
+// for a dialog anywhere in the tail, so an old dialog still on screen matches
+// it too; the poll therefore asks this first. It is true only when the error is
+// the newest thing in the pane, which a newer dialog is not. The text matching
+// and "is it still the latest state" rules live in lib/pane.js.
 function connectionError(paneText) {
   return endsInConnectionError(paneText);
 }
@@ -356,12 +358,14 @@ function pollRunningJobs() {
 
     // Finishing takes priority over this — a prompt that got answered and
     // then exited shouldn't flicker back to "needs input" on its last poll.
-    // needs_input wins over connection_error: a dialog on screen is the
-    // newer, actionable state.
-    job.status = needsInput(pane)
-      ? "needs_input"
-      : connectionError(pane)
-        ? "connection_error"
+    // Between the two stuck states, whichever is latest in the pane wins:
+    // connectionError() is true only when nothing (a dialog included) follows
+    // the error, and needsInput() alone cannot tell an old dialog from a live
+    // one, so it must not be asked first.
+    job.status = connectionError(pane)
+      ? "connection_error"
+      : needsInput(pane)
+        ? "needs_input"
         : "running";
     trackConnectionError(job);
   }

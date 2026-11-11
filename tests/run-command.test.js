@@ -475,12 +475,31 @@ describe("connection_error status and supervisor notice", () => {
     expect(mod.findRunningJobForTicket("PROJ-1")).toBe(job);
   });
 
-  it("lets a permission dialog win over the error", async () => {
+  it("lets a permission dialog newer than the error win", async () => {
     const t = await load();
     const job = addJob(t);
     jobPane = `${ERROR_LINE}\nDo you want to proceed?\n❯ 1. Yes\n  2. No`;
     t.pollRunningJobs();
     expect(job.status).toBe("needs_input");
+  });
+
+  it("lets an error newer than an old permission dialog win", async () => {
+    const t = await load();
+    const job = addJob(t);
+    jobPane = `Do you want to proceed?\n❯ 1. Yes\n  2. No\n⏺ Ran the command\n${ERROR_LINE}\n\n${box()}`;
+    // Precondition: the dialog text alone would have read as needs_input.
+    expect(t.needsInput(jobPane)).toBe(true);
+    t.pollRunningJobs();
+    expect(job.status).toBe("connection_error");
+  });
+
+  it("does not flag a session whose reply only quotes the error", async () => {
+    const t = await load();
+    const job = addJob(t);
+    jobPane = `⏺ The pane ends in "API Error: Connection lost mid-response" when the stream drops.\n\n${box()}`;
+    t.pollRunningJobs();
+    expect(job.status).toBe("running");
+    expect(sent).toHaveLength(0);
   });
 
   it("builds a notice from fixed text and the id, never the title or prompt", async () => {
