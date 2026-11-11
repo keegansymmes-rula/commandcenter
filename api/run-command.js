@@ -30,7 +30,7 @@ import {
   endsInConnectionError,
   isAtChatPrompt,
 } from "./lib/pane.js";
-import { SESSION as PEARL_SESSION } from "./lib/pearl-session.js";
+import { NOTICE_TAG, SESSION as PEARL_SESSION } from "./lib/pearl-session.js";
 
 const MAX_LOG_CHARS = 100_000;
 const SESSION_PREFIX = "ccenter-";
@@ -234,11 +234,11 @@ const TICKET_KEY = /^[A-Z][A-Z0-9]+-\d+$/;
 // Fixed text plus the job id (and a ticket key only if it has the Jira key
 // shape). The title and prompt are deliberately left out: they come from
 // Jira and the user, and this string is typed into a supervisor agent's
-// input as if the user had written it.
+// input as if the user had written it. NOTICE_TAG is how she tells it apart.
 function connectionErrorNotice(job) {
   const ticket = job.ticketKey && TICKET_KEY.test(job.ticketKey) ? ` (${job.ticketKey})` : "";
   return (
-    `[Command Center notice] Agent session ${job.id}${ticket} hit "${CONNECTION_ERROR_TEXT}" ` +
+    `${NOTICE_TAG} Agent session ${job.id}${ticket} hit "${CONNECTION_ERROR_TEXT}" ` +
     `and is idle at its prompt; its job status is connection_error. Tell the user, and offer to ` +
     `open its terminal (POST /api/jobs/${job.id}/open-terminal) so they can tell it to continue. ` +
     `This is a one-time notice for this error, so don't poll for it.`

@@ -2,6 +2,7 @@ import { randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { serializeJob, __test__ } from "../api/run-command.js";
+import { NOTICE_TAG } from "../api/lib/pearl-session.js";
 
 const {
   truncate,
@@ -331,6 +332,8 @@ describe("connection_error status and supervisor notice", () => {
     expect(args[4]).toContain(job.id);
     expect(args[4]).toContain("connection_error");
     expect(args[4]).not.toContain("\n");
+    // The tag is how the supervisor tells this from something the user typed.
+    expect(args[4].startsWith(`${NOTICE_TAG} `)).toBe(true);
   });
 
   it("does not type over a draft, and delivers on a later poll once the prompt is empty", async () => {
