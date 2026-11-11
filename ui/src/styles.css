@@ -632,7 +632,8 @@ body {
   border-left-color: var(--blue);
   animation: pulse-glow 2.2s ease-in-out infinite;
 }
-.session-row--needs_input {
+.session-row--needs_input,
+.session-row--connection_error {
   border-left-color: var(--amber);
   background: rgba(240, 180, 41, 0.08);
 }
@@ -651,7 +652,8 @@ body {
   object-fit: cover;
   border-radius: 3px;
 }
-.session-status--needs_input { color: var(--amber); }
+.session-status--needs_input,
+.session-status--connection_error { color: var(--amber); }
 .session-status--succeeded { color: var(--green); }
 .session-status--failed { color: var(--red); }
 

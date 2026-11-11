@@ -8,6 +8,7 @@
 
 import { useEffect, useState } from "react";
 import { StatusIcon } from "./StatusIcon.jsx";
+import { LIVE_STATUSES } from "./jobStatus.js";
 
 function useOpenInIterm(jobId) {
   const [state, setState] = useState("idle"); // idle | opening | error
@@ -90,11 +91,30 @@ function SessionCard({ job, onClose }) {
         {job.status === "needs_input" && (
           <span className="session-needs-input">needs input</span>
         )}
+        {job.status === "connection_error" && (
+          <span
+            className="session-needs-input"
+            title="Claude Code lost its connection mid-response and is idle — open the terminal and tell it to continue"
+          >
+            connection lost
+          </span>
+        )}
         {job.exitCode !== null && job.exitCode !== 0 && (
           <span className="session-exit">exit {job.exitCode}</span>
         )}
         {state === "opening" && <span className="session-opening">opening…</span>}
       </button>
+      {job.status === "connection_error" && canOpen && (
+        <button
+          type="button"
+          className="session-attach"
+          title="Open this session's terminal so you can tell it to continue"
+          onClick={open}
+          disabled={state === "opening"}
+        >
+          ↗ continue
+        </button>
+      )}
       {job.hasBrain && (
         <a
           className="session-brain"
@@ -121,12 +141,13 @@ function SessionCard({ job, onClose }) {
 }
 
 export function SessionColumn({ jobs, onRefresh, onClose }) {
-  // needs_input is still unresolved, not done — keep polling it the same as
-  // running, so a session that gets unstuck (or times out) updates without
-  // a manual refresh.
-  const isLive = (j) => j.status === "running" || j.status === "needs_input";
+  // needs_input and connection_error are still unresolved, not done — keep
+  // polling them the same as running, so a session that gets unstuck (or
+  // times out) updates without a manual refresh.
+  const isLive = (j) => LIVE_STATUSES.includes(j.status);
   const hasRunning = jobs.some((j) => j.status === "running");
   const hasNeedsInput = jobs.some((j) => j.status === "needs_input");
+  const hasConnectionError = jobs.some((j) => j.status === "connection_error");
   const hasLive = jobs.some(isLive);
 
   useEffect(() => {
@@ -146,6 +167,11 @@ export function SessionColumn({ jobs, onRefresh, onClose }) {
         {hasNeedsInput && (
           <span className="focus-column-live focus-column-live--needs-input">
             needs input
+          </span>
+        )}
+        {hasConnectionError && (
+          <span className="focus-column-live focus-column-live--needs-input">
+            connection lost
           </span>
         )}
       </div>
