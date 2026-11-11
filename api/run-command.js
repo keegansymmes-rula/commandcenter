@@ -112,9 +112,13 @@ function metaFilePath(id) {
 // Present while the supervisor has been told about the job's current
 // connection error (or we gave up trying). On disk rather than on the job so
 // an API restart (`node --watch` restarts on every edit) does not re-announce
-// a session that is still stuck.
+// a session that is still stuck. Ids come from tmux session names, which can
+// hold anything, so an id outside SAFE_ID gets no marker (null) rather than a
+// path that could leave JOBS_DIR.
+const SAFE_ID = /^[A-Za-z0-9-]+$/;
+
 function connectionErrorMarkerPath(id) {
-  return join(JOBS_DIR, `${id}.connection-error`);
+  return SAFE_ID.test(id) ? join(JOBS_DIR, `${id}.connection-error`) : null;
 }
 
 // The only shell-interpolated parts are paths we generated ourselves
@@ -228,7 +232,6 @@ function finish(job, { exitCode, error }) {
 // dialog for longer than that is already asking for the human, and the
 // session still shows connection_error in the dashboard and /api/jobs.
 const NOTICE_MAX_ATTEMPTS = 30;
-const SAFE_ID = /^[A-Za-z0-9-]+$/;
 const TICKET_KEY = /^[A-Z][A-Z0-9]+-\d+$/;
 
 // Fixed text plus the job id (and a ticket key only if it has the Jira key
@@ -285,7 +288,7 @@ function trackConnectionError(job) {
     job.noticeDone = false;
     // existsSync first: this runs for every live job on every poll, and
     // almost always there is nothing to remove.
-    if (existsSync(marker)) {
+    if (marker && existsSync(marker)) {
       try {
         unlinkSync(marker);
       } catch {
@@ -295,7 +298,7 @@ function trackConnectionError(job) {
     return;
   }
 
-  if (job.noticeDone || existsSync(marker)) {
+  if (job.noticeDone || (marker && existsSync(marker))) {
     job.noticeDone = true;
     return;
   }
@@ -313,6 +316,7 @@ function trackConnectionError(job) {
 }
 
 function writeMarker(path, content) {
+  if (!path) return;
   try {
     writeFileSync(path, `${content} ${new Date().toISOString()}\n`, "utf-8");
   } catch {
@@ -616,7 +620,7 @@ export function closeJob(id) {
     exitFilePath(id),
     metaFilePath(id),
     connectionErrorMarkerPath(id),
-  ]) {
+  ].filter(Boolean)) {
     try {
       unlinkSync(path);
     } catch {
@@ -641,4 +645,5 @@ export const __test__ = {
   pollRunningJobs,
   syncJobsFromTmux,
   NOTICE_MAX_ATTEMPTS,
+  LIVE_STATUSES,
 };

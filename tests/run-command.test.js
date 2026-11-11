@@ -385,6 +385,37 @@ describe("connection_error status and supervisor notice", () => {
     expect(sent).toHaveLength(2);
   });
 
+  it("gives an id with path characters no marker path, so nothing can leave the jobs dir", async () => {
+    const t = await load();
+    expect(t.connectionErrorMarkerPath("ccenter-../../etc/passwd")).toBeNull();
+    expect(t.connectionErrorMarkerPath("a/b")).toBeNull();
+    expect(t.connectionErrorMarkerPath("")).toBeNull();
+    expect(t.connectionErrorMarkerPath("cerr-1234")).toMatch(/cerr-1234\.connection-error$/);
+  });
+
+  it("gives up on a job whose id is not safe, without a notice or any marker file", async () => {
+    const t = await load();
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const id = "../escape";
+    const job = {
+      id,
+      ticketKey: null,
+      title: null,
+      tmuxSession: "ccenter-escape",
+      status: "running",
+      log: "",
+      error: null,
+    };
+    t.jobs.set(id, job);
+    jobPane = erroredPane;
+    t.pollRunningJobs();
+    expect(job.status).toBe("connection_error");
+    expect(job.noticeDone).toBe(true);
+    expect(sent).toHaveLength(0);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+
   it("does not re-announce after a restart while the marker is still present", async () => {
     const t = await load();
     const job = addJob(t);

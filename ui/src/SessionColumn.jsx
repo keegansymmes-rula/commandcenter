@@ -93,7 +93,7 @@ function SessionCard({ job, onClose }) {
         )}
         {job.status === "connection_error" && (
           <span
-            className="session-needs-input"
+            className="session-connection-error"
             title="Claude Code lost its connection mid-response and is idle — open the terminal and tell it to continue"
           >
             connection lost
@@ -170,7 +170,7 @@ export function SessionColumn({ jobs, onRefresh, onClose }) {
           </span>
         )}
         {hasConnectionError && (
-          <span className="focus-column-live focus-column-live--needs-input">
+          <span className="focus-column-live focus-column-live--connection-error">
             connection lost
           </span>
         )}

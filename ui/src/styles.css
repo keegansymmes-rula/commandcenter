@@ -364,7 +364,8 @@ body {
   font-weight: 600;
 }
 
-.focus-column-live--needs-input {
+.focus-column-live--needs-input,
+.focus-column-live--connection-error {
   background: rgba(240, 180, 41, 0.15);
   color: var(--amber);
 }
@@ -690,7 +691,8 @@ body {
   letter-spacing: 0.03em;
 }
 
-.session-needs-input {
+.session-needs-input,
+.session-connection-error {
   flex-shrink: 0;
   padding: 1px 6px;
   border-radius: 3px;
