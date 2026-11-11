@@ -18,6 +18,7 @@ import { execFileSync, spawn } from "node:child_process";
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { isAtChatPrompt } from "./lib/pane.js";
 import { SESSION } from "./lib/pearl-session.js";
 
 const TMUX = "/opt/homebrew/bin/tmux";
@@ -381,15 +382,10 @@ async function captureReply() {
 // Typing blind into a TUI is only safe when her chat input box is showing:
 // a `❯` line framed by the box's top and bottom borders. A permission
 // dialog or menu also uses `❯` for its cursor, but not between borders —
-// injecting text plus Enter there could answer the dialog.
-export function isAtChatPrompt(paneText) {
-  const lines = paneText.split("\n");
-  const promptIndex = lines.findLastIndex((line) => line.startsWith("❯"));
-  if (promptIndex <= 0) return false;
-
-  const isBorder = (line) => line?.startsWith("─") ?? false;
-  return isBorder(lines[promptIndex - 1]) && isBorder(lines[promptIndex + 1]);
-}
+// injecting text plus Enter there could answer the dialog. The check lives
+// in lib/pane.js so run-command.js can share it; re-exported for callers
+// of this module.
+export { isAtChatPrompt };
 
 function capturePane() {
   return execFileSync(TMUX, ["capture-pane", "-p", "-t", SESSION], { encoding: "utf-8" });
