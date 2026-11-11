@@ -70,6 +70,8 @@ const CONNECTION_ERROR_PATTERN = new RegExp(`^[ \\t]*⎿[ \\t]*${WRAP_TOLERANT_E
 // `⏺ Bash(...)` / `● Read(...)`: a tool-call header, whose first `⎿` row is
 // that tool's output, not a status line of the session itself.
 const TOOL_CALL_HEADER = /^\s*(?:⏺|●)\s+[\w.:-]+\(/;
+const BLOCK_START = /^\s*(?:⏺|●|❯)(?:\s|$)/;
+const RESULT_ROW = /^\s*⎿/;
 
 // Only the pane's tail is examined: this runs on every poll for every live
 // job, and the whole scrollback (up to 100k+ chars) is irrelevant to whether
@@ -85,6 +87,20 @@ const SUPERSEDED = /^\s*(?:❯|>|⏺|●)(?:\s|$)/;
 // Shown on the spinner line while a turn is running, so a session that is
 // retrying on its own is not stuck.
 const WORKING = "esc to interrupt";
+
+// True when the `⎿` row at `row` is the first result row of a tool call. A
+// long header wraps onto indented continuation rows, so the row directly above
+// is not necessarily the header: walk up through continuation rows to the row
+// that opens the block. An earlier `⎿` row, or a block that is not a tool
+// call, means this row is something else (a status line after the tool's
+// output, or after plain reply text).
+function isFirstToolResult(shown, row) {
+  for (let i = row - 1; i >= 0; i -= 1) {
+    if (RESULT_ROW.test(shown[i])) return false;
+    if (BLOCK_START.test(shown[i])) return TOOL_CALL_HEADER.test(shown[i]);
+  }
+  return false;
+}
 
 // Index, into `shown`, of the row the last valid occurrence of the error ends
 // on, or -1. Matching runs on the rows joined with newlines so a wrapped error
@@ -104,7 +120,7 @@ function lastErrorRow(shown) {
   let found = -1;
   for (const match of flat.matchAll(CONNECTION_ERROR_PATTERN)) {
     const start = rowAt(match.index);
-    if (start > 0 && TOOL_CALL_HEADER.test(shown[start - 1])) continue;
+    if (isFirstToolResult(shown, start)) continue;
     found = rowAt(match.index + match[0].length);
   }
   return found;

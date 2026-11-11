@@ -182,6 +182,42 @@ describe("endsInConnectionError", () => {
       expect(endsInConnectionError(text)).toBe(false);
     });
 
+    it("is false when the tool call's header wraps onto a second row", () => {
+      const text = pane(
+        '⏺ Bash(echo "a command long enough that the terminal wrapped it onto',
+        '  a second row" && echo done)',
+        "  ⎿  API Error: Connection lost mid-response. The response above may be incomplete.",
+      );
+      expect(endsInConnectionError(text)).toBe(false);
+    });
+
+    it("is false when the header wraps across several rows", () => {
+      const text = pane(
+        "⏺ Bash(printf 'one two three four five six seven eight nine ten eleven",
+        "  twelve thirteen fourteen fifteen sixteen seventeen eighteen",
+        "  nineteen twenty' | tee out.txt)",
+        "  ⎿  API Error: Connection lost mid-response. The response above may be incomplete.",
+      );
+      expect(endsInConnectionError(text)).toBe(false);
+    });
+
+    it("is true for a real error after a wrapped-header tool's multi-row output", () => {
+      const text = pane(
+        '⏺ Bash(echo "a command long enough that the terminal wrapped it onto',
+        '  a second row" && echo done)',
+        "  ⎿  first line of output",
+        "     second line of output",
+        "",
+        ERROR_LINE,
+      );
+      expect(endsInConnectionError(text)).toBe(true);
+    });
+
+    it("is true for the error after plain reply text, not a tool call", () => {
+      const text = pane("⏺ Here is the plan (see below)", "  and some more detail", ERROR_LINE);
+      expect(endsInConnectionError(text)).toBe(true);
+    });
+
     it("is false when it shows up in a tool call's own header", () => {
       const text = pane('⏺ Grep("API Error: Connection lost mid-response")', "  ⎿  Found 3 lines");
       expect(endsInConnectionError(text)).toBe(false);
