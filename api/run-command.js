@@ -24,7 +24,14 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hasBrainContent } from "./brain.js";
-import { SESSION as PEARL_SESSION } from "./lib/pearl-session.js";
+import { PEARL_NAME, SESSION as PEARL_SESSION } from "./lib/pearl-session.js";
+import {
+  findTranscript,
+  inputBoxIsEmpty,
+  readTranscriptTail,
+  relayIfUndelivered,
+  TMUX_TIMEOUT_MS,
+} from "./lib/report-relay.js";
 
 const MAX_LOG_CHARS = 100_000;
 const SESSION_PREFIX = "ccenter-";
@@ -107,10 +114,15 @@ function metaFilePath(id) {
 // extraArgs is a pre-quoted string fragment (e.g. `--add-dir '/path'`), not
 // an array — it's spliced into a shell string built by this same function,
 // so the caller quotes it the same way promptFile/exitFile already are.
-function innerCommand({ promptFile, exitFile, mode, extraArgs = "" }) {
+//
+// An interactive session is started with a --session-id we choose, so its
+// transcript path is known up front (~/.claude/projects/*/<id>.jsonl) and
+// report-relay.js can read it without guessing which session is whose.
+function innerCommand({ promptFile, exitFile, mode, extraArgs = "", sessionId }) {
   const suffix = extraArgs ? ` ${extraArgs}` : "";
   if (mode === "interactive") {
-    return `claude "$(cat '${promptFile}')" --permission-mode auto${suffix}`;
+    const session = sessionId ? ` --session-id ${sessionId}` : "";
+    return `claude "$(cat '${promptFile}')" --permission-mode auto${session}${suffix}`;
   }
   return `claude -p "$(cat '${promptFile}')" --permission-mode auto${suffix}; echo $? > '${exitFile}'`;
 }
@@ -130,6 +142,15 @@ function readMetaFile(id) {
   } catch {
     return null;
   }
+}
+
+// Read-modify-write so persisting the relay state doesn't clobber the rest of
+// the recovery metadata. A job adopted without a meta file has no session id
+// and is never relayed, so there is nothing to merge into.
+function persistRelay(job) {
+  const meta = readMetaFile(job.id);
+  if (!meta) return;
+  writeMetaFile(job.id, { ...meta, relay: job.relay });
 }
 
 function listLiveSessionNames() {
@@ -175,6 +196,8 @@ function syncJobsFromTmux() {
       prompt: meta?.prompt ?? "(tmux session adopted — no local metadata)",
       cwd: meta?.cwd ?? null,
       mode: meta?.mode ?? "headless",
+      sessionId: meta?.sessionId ?? null,
+      relay: meta?.relay ?? null,
       tmuxSession: session,
       status: "running",
       startedAt: meta?.startedAt ?? null,
@@ -183,6 +206,74 @@ function syncJobsFromTmux() {
       log: "",
       error: null,
     });
+  }
+}
+
+// What the supervisor's terminal can take right now. "busy" covers both a
+// question on screen (typing would answer it) and text already in the input
+// box (pasting would splice into it), and also a tmux call that timed out, so
+// the caller retries rather than giving up on a transient hiccup.
+function supervisorState() {
+  try {
+    execFileSync("tmux", ["has-session", "-t", PEARL_SESSION], {
+      stdio: "ignore",
+      timeout: TMUX_TIMEOUT_MS,
+    });
+  } catch (err) {
+    return err.code === "ETIMEDOUT" ? "busy" : "absent";
+  }
+  try {
+    const pane = execFileSync("tmux", ["capture-pane", "-t", PEARL_SESSION, "-p"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: TMUX_TIMEOUT_MS,
+    });
+    return needsInput(pane) || !inputBoxIsEmpty(pane) ? "busy" : "ready";
+  } catch {
+    return "busy";
+  }
+}
+
+// Types into the supervisor's terminal, which pearl.js deliberately avoids
+// for driving her (a TUI can't be typed into blind). It is acceptable here
+// because supervisorState() has just confirmed she is at an empty prompt, and
+// the text is a single sanitized line. A bracketed paste plus Enter in one tmux
+// invocation, so nothing can interleave between the paste and the submit.
+function deliverToSupervisor(message) {
+  const buffer = `ccrelay-${process.pid}`;
+  execFileSync("tmux", ["load-buffer", "-b", buffer, "-"], {
+    input: message,
+    stdio: ["pipe", "ignore", "ignore"],
+    timeout: TMUX_TIMEOUT_MS,
+  });
+  execFileSync(
+    "tmux",
+    ["paste-buffer", "-p", "-d", "-b", buffer, "-t", PEARL_SESSION, ";", "send-keys", "-t", PEARL_SESSION, "Enter"],
+    { stdio: "ignore", timeout: TMUX_TIMEOUT_MS },
+  );
+}
+
+const relayDeps = {
+  supervisorName: PEARL_NAME,
+  now: () => Date.now(),
+  readPersisted: readMetaFile,
+  persist: persistRelay,
+  locateTranscript: findTranscript,
+  readTranscript: readTranscriptTail,
+  supervisorState,
+  deliver: deliverToSupervisor,
+  log: (message) => console.warn(`[relay] ${message}`),
+};
+
+// A relay is a courtesy on top of polling and closing, never part of them: any
+// failure here is logged and swallowed so it can't stop a job from being
+// polled or closed.
+function tryRelay(job, options) {
+  try {
+    return relayIfUndelivered(job, relayDeps, options);
+  } catch (err) {
+    console.warn(`[relay] job ${job.id}: ${err.message}`);
+    return "error";
   }
 }
 
@@ -225,6 +316,7 @@ function pollRunningJobs() {
     // Finishing takes priority over this — a prompt that got answered and
     // then exited shouldn't flicker back to "needs input" on its last poll.
     job.status = needsInput(pane) ? "needs_input" : "running";
+    if (job.status === "running") tryRelay(job);
   }
 }
 
@@ -255,6 +347,7 @@ export function startCommandJob({
   extraArgs = "",
 }) {
   const session = sessionNameFor(id);
+  const sessionId = mode === "interactive" ? randomUUID() : null;
 
   const job = {
     id,
@@ -263,6 +356,8 @@ export function startCommandJob({
     prompt,
     cwd,
     mode,
+    sessionId,
+    relay: null,
     tmuxSession: session,
     status: "running",
     startedAt: now,
@@ -274,7 +369,7 @@ export function startCommandJob({
   jobs.set(id, job);
 
   writeFileSync(promptFilePath(id), prompt, "utf-8");
-  writeMetaFile(id, { id, ticketKey, title, prompt, cwd, mode, startedAt: now });
+  writeMetaFile(id, { id, ticketKey, title, prompt, cwd, mode, sessionId, startedAt: now });
 
   try {
     execFileSync("tmux", [
@@ -286,7 +381,7 @@ export function startCommandJob({
       cwd,
       "bash",
       "-c",
-      innerCommand({ promptFile: promptFilePath(id), exitFile: exitFilePath(id), mode, extraArgs }),
+      innerCommand({ promptFile: promptFilePath(id), exitFile: exitFilePath(id), mode, extraArgs, sessionId }),
     ]);
     // Without this, tmux kills the pane the instant the inner command exits —
     // attaching a few seconds late would show nothing, and the final output
@@ -447,6 +542,11 @@ export function closeJob(id) {
   const job = jobs.get(id);
   if (!job) return { ok: false, error: "Unknown job" };
 
+  // Last chance to tell the supervisor what an idle session said: once the
+  // job is deleted below, nothing will. Only acts on a session that finished
+  // its turn without reporting; a working or needs_input one is left alone.
+  tryRelay(job, { closing: true });
+
   // Always kill the tmux session, not just for running/needs_input jobs.
   // `remain-on-exit` deliberately keeps a finished job's pane alive (so a
   // human can still attach and read it) — closing a finished card without
@@ -494,4 +594,8 @@ export const __test__ = {
   innerCommand,
   needsInput,
   syncJobsFromTmux,
+  supervisorState,
+  deliverToSupervisor,
+  persistRelay,
+  tryRelay,
 };

@@ -1,11 +1,12 @@
 ---
-description: Report back to Pearl, Command Center's supervisor agent, when a dispatched task ends. Use when you were dispatched by Command Center and you've finished, failed, or are stopping because you're blocked.
+description: Report back to the supervisor agent (Pearl by default) when a dispatched task ends. Use when you were dispatched by Command Center and you've finished, failed, or are stopping because you're blocked.
 ---
 
-# Command Center: reporting back to Pearl
+# Command Center: reporting back to the supervisor
 
-Pearl doesn't poll for results. Your message is how she learns how the task
-went, and she relays it to the user. Your prompt names her (usually `Pearl`).
+The supervisor doesn't poll for results. Your message is how it learns how
+the task went, and it relays that to the user. Your prompt names it (`Pearl`
+unless the install renamed it).
 
 ## When
 
@@ -22,16 +23,30 @@ after you send.
 ## How
 
 ```
-SendMessage({ to: "Pearl", message: "..." })
+SendMessage({ to: "<name from your prompt>", message: "..." })
 ```
 
-Use the name your prompt gives, if it's not `Pearl`.
+Use the name your prompt gives, exactly. If it names none, use `Pearl`.
+
+## If the send is denied or errors
+
+The auto mode classifier sometimes blocks `SendMessage`. A denial is not a
+reason to stop quietly, because then nobody learns the work is done.
+
+1. Retry once, with the same name and message.
+2. If that fails too, don't try again. Start your final output with
+   `UNDELIVERED to <name>:` followed by the report, so the user sees it in
+   the pane.
+
+Never retry more than once. (Command Center also passes your last message to
+the supervisor if you go idle without having reported, so make the final
+message stand on its own either way.)
 
 ## What to say
 
 One or two sentences: what happened, and whether anything needs the user's
-attention. Make the first sentence stand on its own. Pearl may relay it
-as-is.
+attention. Make the first sentence stand on its own. The supervisor may relay
+it as-is.
 
 - Done: "NEV-1234 is done: PR #482 drops the insurance section, tests pass.
   Nothing needs the user."
