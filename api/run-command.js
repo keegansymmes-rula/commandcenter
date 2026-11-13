@@ -60,6 +60,10 @@ function truncate(text) {
 const NEEDS_INPUT_QUESTION = /Do you want to [^\n?]*\?/;
 const NEEDS_INPUT_MENU_CURSOR = /^\s*❯\s*\d+\./m;
 
+function hasMenuCursor(paneText) {
+  return NEEDS_INPUT_MENU_CURSOR.test(paneText.slice(-2000));
+}
+
 function needsInput(paneText) {
   const tail = paneText.slice(-2000);
   if (NEEDS_INPUT_QUESTION.test(tail)) return true;
@@ -80,10 +84,17 @@ function isLive(status) {
 // signal that can see one. Hooks alone can't tell "stopped" from "blocked on a
 // permission dialog" — the Stop hook never fires for a turn that's still
 // waiting on one, so the state stays "running" there and the pane decides.
+//
+// Once Stop has fired, though, the agent's own closing message is the last
+// thing on screen, and it can contain "Do you want to ...?" as plain prose.
+// So an idle session only counts as needs_input for a rendered menu (the
+// "❯ 1." cursor), which prose doesn't produce, e.g. a menu the user opened
+// with a slash command.
 function resolveLiveStatus({ mode, paneText, hookState }) {
-  if (needsInput(paneText)) return "needs_input";
-  if (mode === "interactive" && hookState === "idle") return "idle";
-  return "running";
+  if (mode === "interactive" && hookState === "idle") {
+    return hasMenuCursor(paneText) ? "needs_input" : "idle";
+  }
+  return needsInput(paneText) ? "needs_input" : "running";
 }
 
 function sessionNameFor(id) {

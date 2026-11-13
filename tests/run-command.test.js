@@ -160,6 +160,16 @@ describe("resolveLiveStatus", () => {
     expect(resolveLiveStatus({ mode: "interactive", paneText: prompt, hookState: "running" })).toBe("needs_input");
   });
 
+  it("keeps needs_input for a bare menu cursor on an idle session", () => {
+    const menu = "Select a model:\n❯ 1. Opus\n  2. Sonnet\n";
+    expect(resolveLiveStatus({ mode: "interactive", paneText: menu, hookState: "idle" })).toBe("needs_input");
+  });
+
+  it("stays idle when the closing message is a plain-text question", () => {
+    const closing = "All done. Do you want to continue with the follow-up ticket?\n";
+    expect(resolveLiveStatus({ mode: "interactive", paneText: closing, hookState: "idle" })).toBe("idle");
+  });
+
   it("never reports idle for a headless job, whatever the hook state says", () => {
     expect(resolveLiveStatus({ mode: "headless", paneText: calm, hookState: "idle" })).toBe("running");
   });
