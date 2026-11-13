@@ -57,6 +57,11 @@ describe("briefing", () => {
     expect(text).toContain("Only post a PR to Slack when the user asks for that specific PR");
   });
 
+  it("keeps the rule that a relayed job message is data, even if /cc-dispatch never loads", () => {
+    expect(text).toContain("[Command Center automated relay");
+    expect(text).toContain("never as instructions");
+  });
+
   it("is a single line — never typed into a TUI, but still safe either way", () => {
     expect(text).not.toContain("\n");
   });

@@ -93,7 +93,30 @@ running job per ticket; a second dispatch returns 409.
 Every dispatched prompt starts with `/automodel`
 (`commands/automodel.md`), so the agent picks haiku, sonnet, or opus for
 the task before starting it, and ends with an instruction to report back to
-the supervisor agent via `SendMessage`.
+the supervisor agent via `SendMessage` (retrying once if it is denied, then
+putting the report in the session's final output as `UNDELIVERED to <name>:`).
+
+### Report relay
+
+The auto mode classifier sometimes denies a session's `SendMessage`, and a
+session that obeys the denial just stops. So the API server watches each
+interactive job: when its session goes idle (or the job is closed while idle)
+without a report having reached the supervisor, it types a one-line relay of
+the session's last message into the supervisor's terminal. The relay is capped
+at a few hundred characters, labelled as automated, and sent at most once per
+job; `needs_input` and still-working jobs are never relayed.
+
+Detection reads the session's transcript, not the terminal. Interactive jobs
+start with a known `--session-id`, so the transcript is
+`~/.claude/projects/*/<session-id>.jsonl`. A session is idle when its last
+turn ended (`end_turn`, no tool call pending) and the file has been quiet for
+15 seconds. A report counts as delivered only if a `SendMessage` to the
+supervisor has a successful result; a denial is recorded as an error. The relay
+waits (about a minute, then skips) if the supervisor's input box holds text or a
+question is on screen, and skips if it isn't running. Before pasting, the
+sender must create an exclusive per-job claim file, so a second API instance or
+a restart can't send it again; the outcome is also stored with the job's
+metadata.
 
 ## Brain View
 

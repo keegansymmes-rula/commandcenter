@@ -1,3 +1,4 @@
+import { rmSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { serializeJob, __test__ } from "../api/run-command.js";
 
@@ -8,6 +9,9 @@ const {
   idFromSessionName,
   innerCommand,
   needsInput,
+  tryRelay,
+  claimRelay,
+  relayClaimPath,
 } = __test__;
 
 describe("truncate", () => {
@@ -81,6 +85,68 @@ describe("innerCommand", () => {
     expect(cmd).not.toContain("/tmp/x.exit");
     expect(cmd).toContain("claude \"$(cat '/tmp/x.prompt')\"");
     expect(cmd).toContain("--permission-mode auto");
+  });
+});
+
+describe("innerCommand session id", () => {
+  const base = { promptFile: "/tmp/x.prompt", exitFile: "/tmp/x.exit" };
+  const uuid = "11111111-2222-3333-4444-555555555555";
+
+  it("starts an interactive session with a known --session-id, so its transcript can be found", () => {
+    const cmd = innerCommand({ ...base, mode: "interactive", sessionId: uuid });
+    expect(cmd).toContain(`--session-id ${uuid}`);
+  });
+
+  it("puts the session id before any extra args", () => {
+    const cmd = innerCommand({ ...base, mode: "interactive", sessionId: uuid, extraArgs: "--add-dir '/b'" });
+    expect(cmd.indexOf("--session-id")).toBeLessThan(cmd.indexOf("--add-dir"));
+  });
+
+  it("leaves it off when none is given, and off headless runs", () => {
+    expect(innerCommand({ ...base, mode: "interactive" })).not.toContain("--session-id");
+    expect(innerCommand({ ...base, sessionId: uuid })).not.toContain("--session-id");
+  });
+});
+
+describe("tryRelay", () => {
+  it("never lets a relay failure escape into polling or closing", () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    // Reading status throws partway through relayIfUndelivered.
+    const job = {
+      id: "j",
+      mode: "interactive",
+      sessionId: "s",
+      relay: null,
+      get status() {
+        throw new Error("boom");
+      },
+    };
+    expect(() => tryRelay(job, { closing: true })).not.toThrow();
+    expect(tryRelay(job)).toBe("error");
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("does nothing for a job with no relay to make", () => {
+    expect(tryRelay({ id: "j", mode: "headless", relay: null, status: "running" })).toBe("not-applicable");
+  });
+});
+
+describe("claimRelay", () => {
+  const id = `claim-test-${process.pid}`;
+
+  afterEach(() => {
+    rmSync(relayClaimPath(id), { force: true });
+  });
+
+  it("succeeds once and then reports the claim as held, atomically", () => {
+    expect(claimRelay(id)).toBe(true);
+    expect(claimRelay(id)).toBe(false);
+  });
+
+  it("raises on a failure that is not 'already claimed', so the relay aborts", () => {
+    // A path under a directory that does not exist fails with ENOENT, not EEXIST.
+    expect(() => claimRelay("missing-dir/nested/id")).toThrow();
   });
 });
 
