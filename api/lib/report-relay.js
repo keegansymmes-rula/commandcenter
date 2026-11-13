@@ -203,11 +203,15 @@ const scratch = new WeakMap();
 // Called from the job poll for a running interactive job, and from closeJob.
 // Returns a short outcome string; the caller only logs it.
 //
-// At most once per job. The state is persisted before the paste, not after,
-// so a crash in between leaves the job marked rather than eligible for a
-// second relay. A duplicate relay confuses the supervisor; a missed one is
-// still visible on the dashboard, so the trade goes that way. It also means a
-// failed or skipped relay is final: nothing here retries forever.
+// At most once per job. Before pasting, the sender must win deps.claim(), an
+// exclusive create that only one process (or one poll) can succeed at: a read
+// of the meta file followed by a write would let two API instances, which
+// DASHBOARD_PORT allows, both see "unsent" and both paste. The claim is taken
+// before the paste, not after, and is never released, so a crash in between
+// leaves the job claimed rather than eligible for a second relay. A duplicate
+// relay confuses the supervisor; a missed one is still visible on the
+// dashboard, so the trade goes that way. It also means a failed or skipped
+// relay is final: nothing here retries forever.
 export function relayIfUndelivered(job, deps, { closing = false } = {}) {
   if (job.mode !== "interactive" || !job.sessionId) return "not-applicable";
   if (job.relay) return "already-handled";
@@ -257,6 +261,24 @@ export function relayIfUndelivered(job, deps, { closing = false } = {}) {
       return skip("supervisor input stayed busy for about a minute");
     }
     return "deferred";
+  }
+
+  // An error here (not just losing) aborts before the paste: without a
+  // durable claim there is nothing to stop a duplicate after a restart.
+  let claimed;
+  try {
+    claimed = deps.claim(job.id);
+  } catch (err) {
+    deps.log(`report relay could not claim job ${job.id}: ${err.message}`);
+    settle(job, deps, "failed", `could not claim the relay: ${err.message}`);
+    return "failed";
+  }
+  if (!claimed) {
+    // Another process has it, or an earlier run claimed it and died before
+    // recording the outcome. Either way it is not ours to send. Held in memory
+    // only, which stops this process re-checking every poll.
+    job.relay = { state: "sending", at: new Date(deps.now()).toISOString(), reason: "claimed elsewhere" };
+    return "already-handled";
   }
 
   settle(job, deps, "sending");

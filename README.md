@@ -113,8 +113,10 @@ turn ended (`end_turn`, no tool call pending) and the file has been quiet for
 15 seconds. A report counts as delivered only if a `SendMessage` to the
 supervisor has a successful result; a denial is recorded as an error. The relay
 waits (about a minute, then skips) if the supervisor's input box holds text or a
-question is on screen, and skips if it isn't running. Whether a relay was sent
-is stored with the job's metadata, so it survives an API restart.
+question is on screen, and skips if it isn't running. Before pasting, the
+sender must create an exclusive per-job claim file, so a second API instance or
+a restart can't send it again; the outcome is also stored with the job's
+metadata.
 
 ## Brain View
 

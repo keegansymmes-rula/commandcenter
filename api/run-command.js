@@ -93,6 +93,10 @@ function metaFilePath(id) {
   return join(JOBS_DIR, `${id}.meta.json`);
 }
 
+function relayClaimPath(id) {
+  return join(JOBS_DIR, `${id}.relay`);
+}
+
 // The only shell-interpolated parts are paths we generated ourselves
 // (uuid-based, no quotes/spaces) — the arbitrary user prompt text goes
 // through `cat` on a file, never through shell string interpolation, so it
@@ -144,8 +148,23 @@ function readMetaFile(id) {
   }
 }
 
+// The one thing that makes a relay at-most-once: creating the file fails if it
+// already exists, atomically, so of two API processes (DASHBOARD_PORT allows
+// it) or two polls only one gets to paste. EEXIST means someone else holds it;
+// any other error propagates so the relay aborts instead of sending unclaimed.
+function claimRelay(id) {
+  try {
+    writeFileSync(relayClaimPath(id), String(process.pid), { flag: "wx" });
+    return true;
+  } catch (err) {
+    if (err.code === "EEXIST") return false;
+    throw err;
+  }
+}
+
 // Read-modify-write so persisting the relay state doesn't clobber the rest of
-// the recovery metadata. A job adopted without a meta file has no session id
+// the recovery metadata. This is the displayed outcome, not the guard: a lost
+// write here can't cause a second paste, because the claim file already exists. A job adopted without a meta file has no session id
 // and is never relayed, so there is nothing to merge into.
 function persistRelay(job) {
   const meta = readMetaFile(job.id);
@@ -258,6 +277,7 @@ const relayDeps = {
   now: () => Date.now(),
   readPersisted: readMetaFile,
   persist: persistRelay,
+  claim: claimRelay,
   locateTranscript: findTranscript,
   readTranscript: readTranscriptTail,
   supervisorState,
@@ -574,7 +594,7 @@ export function closeJob(id) {
   }
 
   jobs.delete(id);
-  for (const path of [promptFilePath(id), exitFilePath(id), metaFilePath(id)]) {
+  for (const path of [promptFilePath(id), exitFilePath(id), metaFilePath(id), relayClaimPath(id)]) {
     try {
       unlinkSync(path);
     } catch {
@@ -597,5 +617,7 @@ export const __test__ = {
   supervisorState,
   deliverToSupervisor,
   persistRelay,
+  claimRelay,
+  relayClaimPath,
   tryRelay,
 };

@@ -1,3 +1,4 @@
+import { rmSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { serializeJob, __test__ } from "../api/run-command.js";
 
@@ -9,6 +10,8 @@ const {
   innerCommand,
   needsInput,
   tryRelay,
+  claimRelay,
+  relayClaimPath,
 } = __test__;
 
 describe("truncate", () => {
@@ -126,6 +129,24 @@ describe("tryRelay", () => {
 
   it("does nothing for a job with no relay to make", () => {
     expect(tryRelay({ id: "j", mode: "headless", relay: null, status: "running" })).toBe("not-applicable");
+  });
+});
+
+describe("claimRelay", () => {
+  const id = `claim-test-${process.pid}`;
+
+  afterEach(() => {
+    rmSync(relayClaimPath(id), { force: true });
+  });
+
+  it("succeeds once and then reports the claim as held, atomically", () => {
+    expect(claimRelay(id)).toBe(true);
+    expect(claimRelay(id)).toBe(false);
+  });
+
+  it("raises on a failure that is not 'already claimed', so the relay aborts", () => {
+    // A path under a directory that does not exist fails with ENOENT, not EEXIST.
+    expect(() => claimRelay("missing-dir/nested/id")).toThrow();
   });
 });
 

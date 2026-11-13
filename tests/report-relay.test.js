@@ -262,6 +262,7 @@ describe("relayIfUndelivered", () => {
   let events;
   let supervisor;
   let transcript;
+  let claimHeld;
   let deps;
 
   const idleUndelivered = () => [assistantText("The work is finished; PR #1 is up.")];
@@ -281,6 +282,7 @@ describe("relayIfUndelivered", () => {
     delivered = [];
     events = [];
     supervisor = "ready";
+    claimHeld = false;
     transcript = { records: idleUndelivered(), mtimeMs: T0 - 60_000 };
     deps = {
       supervisorName: "Jarvis",
@@ -289,6 +291,13 @@ describe("relayIfUndelivered", () => {
       persist: (job) => {
         events.push(`persist:${job.relay.state}`);
         persisted = { relay: job.relay };
+      },
+      // Models the exclusive-create claim: only the first caller wins.
+      claim: () => {
+        events.push("claim");
+        if (claimHeld) return false;
+        claimHeld = true;
+        return true;
       },
       locateTranscript: () => ({ path: "/t.jsonl", mtimeMs: transcript.mtimeMs }),
       readTranscript: () => transcript.records.map((r) => JSON.stringify(r)).join("\n"),
@@ -352,12 +361,64 @@ describe("relayIfUndelivered", () => {
     expect(delivered).toHaveLength(1);
   });
 
-  it("marks the job before pasting, so a crash mid-send cannot double-send", () => {
+  it("claims the job before pasting, so a crash mid-send cannot double-send", () => {
     relayIfUndelivered(makeJob(), deps);
-    expect(events).toEqual(["persist:sending", "deliver", "persist:sent"]);
-    // What a restart would see if the process died right after the first persist:
-    persisted = { relay: { state: "sending" } };
+    expect(events).toEqual(["claim", "persist:sending", "deliver", "persist:sent"]);
+  });
+
+  it("does not paste after a restart that finds the claim but no recorded outcome", () => {
+    // The process died after claiming and before persisting anything: meta
+    // still says nothing, but the claim file exists.
+    claimHeld = true;
+    const job = makeJob();
+    expect(relayIfUndelivered(job, deps)).toBe("already-handled");
+    expect(delivered).toHaveLength(0);
+    // And it stops re-checking on every later poll.
+    const before = events.length;
+    expect(relayIfUndelivered(job, deps)).toBe("already-handled");
+    expect(events).toHaveLength(before);
+  });
+
+  it("lets only one of two concurrent processes paste", () => {
+    // Two API instances see the same unsent job; the shared claim picks one.
+    // The second still reads stale metadata (the first's write hasn't landed
+    // for it), so only the claim stands between it and a duplicate paste.
+    const other = { ...deps, readPersisted: () => null, deliver: (m) => delivered.push(`other:${m}`) };
+    const a = relayIfUndelivered(makeJob(), deps);
+    const b = relayIfUndelivered(makeJob(), other);
+    expect([a, b].sort()).toEqual(["already-handled", "sent"]);
+    expect(delivered).toHaveLength(1);
+  });
+
+  it("aborts before pasting when the claim cannot be made at all", () => {
+    deps.claim = () => {
+      throw new Error("EACCES: permission denied");
+    };
+    const job = makeJob();
+    expect(relayIfUndelivered(job, deps)).toBe("failed");
+    expect(delivered).toHaveLength(0);
+    expect(job.relay.state).toBe("failed");
+    expect(deps.log).toHaveBeenCalledWith(expect.stringContaining("could not claim"));
+  });
+
+  it("pastes even if recording the outcome fails, because the claim already guards against a repeat", () => {
+    // The meta write is only the displayed outcome; losing it can't re-send.
+    deps.persist = () => {};
+    const job = makeJob();
+    expect(relayIfUndelivered(job, deps)).toBe("sent");
+    expect(delivered).toHaveLength(1);
+    // A restart re-adopts the job with no recorded outcome; the claim holds.
     expect(relayIfUndelivered(makeJob(), deps)).toBe("already-handled");
+    expect(delivered).toHaveLength(1);
+  });
+
+  it("does not claim for outcomes that send nothing", () => {
+    transcript.records = [sendTo("Jarvis", "t1"), okResult("t1"), assistantText("Done.")];
+    relayIfUndelivered(makeJob(), deps);
+    supervisor = "absent";
+    transcript.records = idleUndelivered();
+    relayIfUndelivered(makeJob({ id: "job-2" }), deps);
+    expect(events).not.toContain("claim");
   });
 
   it("leaves a needs_input job alone", () => {
