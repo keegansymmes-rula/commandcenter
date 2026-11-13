@@ -60,10 +60,41 @@ function truncate(text) {
 const NEEDS_INPUT_QUESTION = /Do you want to [^\n?]*\?/;
 const NEEDS_INPUT_MENU_CURSOR = /^\s*❯\s*\d+\./m;
 
+function hasMenuCursor(paneText) {
+  return NEEDS_INPUT_MENU_CURSOR.test(paneText.slice(-2000));
+}
+
 function needsInput(paneText) {
   const tail = paneText.slice(-2000);
   if (NEEDS_INPUT_QUESTION.test(tail)) return true;
   return NEEDS_INPUT_MENU_CURSOR.test(tail);
+}
+
+// A job whose tmux session is still up. idle is live too: the agent stopped
+// but the session is open, and closing it is still the human's call.
+const LIVE_STATUSES = new Set(["running", "needs_input", "idle"]);
+
+function isLive(status) {
+  return LIVE_STATUSES.has(status);
+}
+
+// What a live job's status should be, given its pane and (interactive only)
+// the state its own hooks last wrote. needs_input wins over idle on purpose:
+// a prompt on screen is the more urgent fact, and the pane check is the only
+// signal that can see one. Hooks alone can't tell "stopped" from "blocked on a
+// permission dialog" — the Stop hook never fires for a turn that's still
+// waiting on one, so the state stays "running" there and the pane decides.
+//
+// Once Stop has fired, though, the agent's own closing message is the last
+// thing on screen, and it can contain "Do you want to ...?" as plain prose.
+// So an idle session only counts as needs_input for a rendered menu (the
+// "❯ 1." cursor), which prose doesn't produce, e.g. a menu the user opened
+// with a slash command.
+function resolveLiveStatus({ mode, paneText, hookState }) {
+  if (mode === "interactive" && hookState === "idle") {
+    return hasMenuCursor(paneText) ? "needs_input" : "idle";
+  }
+  return needsInput(paneText) ? "needs_input" : "running";
 }
 
 function sessionNameFor(id) {
@@ -86,6 +117,45 @@ function metaFilePath(id) {
   return join(JOBS_DIR, `${id}.meta.json`);
 }
 
+function stateFilePath(id) {
+  return join(JOBS_DIR, `${id}.state`);
+}
+
+// "idle" or "running", as last written by the session's own hooks; null when
+// the file doesn't exist (headless job, or an interactive one started before
+// these hooks existed) or holds anything else.
+function readHookState(id) {
+  try {
+    const state = readFileSync(stateFilePath(id), "utf-8").trim();
+    return state === "idle" || state === "running" ? state : null;
+  } catch {
+    return null;
+  }
+}
+
+// Interactive sessions report their own turn boundaries through Claude Code
+// hooks, scoped to this one session via --settings (an additional settings
+// source, same trick as Pearl's speech hook in pearl.js) so nothing in
+// ~/.claude/settings.json is touched. Stop fires when the agent finishes its
+// turn and sits at the prompt; UserPromptSubmit fires the moment the human
+// types again. PreToolUse also flips back to running because another Stop
+// hook can block a stop and make the agent carry on without any new prompt;
+// without it the card would read idle while work continues. The command
+// quotes the path with double quotes (escaped by JSON.stringify) so the whole
+// settings blob can sit inside single quotes in the shell string.
+function hookSettings(stateFile) {
+  const write = (state) => ({
+    hooks: [{ type: "command", command: `printf ${state} > "${stateFile}"` }],
+  });
+  return JSON.stringify({
+    hooks: {
+      Stop: [write("idle")],
+      UserPromptSubmit: [write("running")],
+      PreToolUse: [write("running")],
+    },
+  });
+}
+
 // The only shell-interpolated parts are paths we generated ourselves
 // (uuid-based, no quotes/spaces) — the arbitrary user prompt text goes
 // through `cat` on a file, never through shell string interpolation, so it
@@ -98,7 +168,9 @@ function metaFilePath(id) {
 // deliberately no exit-code capture for interactive — it isn't "done" when
 // Claude's reply finishes, only when the human closes it (or exits the
 // shell themselves, which the existing "tmux session ended" handling in
-// pollRunningJobs already covers, just without a numeric exit code).
+// pollRunningJobs already covers, just without a numeric exit code). What it
+// does get is hookSettings' state file, so the dashboard can tell "agent
+// stopped, waiting on the human" (idle) from "agent working" (running).
 //
 // --permission-mode auto (not acceptEdits) — same mode Pearl runs in, so
 // every spawned agent (headless, interactive, or Pearl herself) behaves
@@ -107,10 +179,11 @@ function metaFilePath(id) {
 // extraArgs is a pre-quoted string fragment (e.g. `--add-dir '/path'`), not
 // an array — it's spliced into a shell string built by this same function,
 // so the caller quotes it the same way promptFile/exitFile already are.
-function innerCommand({ promptFile, exitFile, mode, extraArgs = "" }) {
+function innerCommand({ promptFile, exitFile, stateFile, mode, extraArgs = "" }) {
   const suffix = extraArgs ? ` ${extraArgs}` : "";
   if (mode === "interactive") {
-    return `claude "$(cat '${promptFile}')" --permission-mode auto${suffix}`;
+    const hooks = stateFile ? ` --settings '${hookSettings(stateFile)}'` : "";
+    return `claude "$(cat '${promptFile}')" --permission-mode auto${hooks}${suffix}`;
   }
   return `claude -p "$(cat '${promptFile}')" --permission-mode auto${suffix}; echo $? > '${exitFile}'`;
 }
@@ -197,7 +270,7 @@ function pollRunningJobs() {
   syncJobsFromTmux();
 
   for (const job of jobs.values()) {
-    if (job.status !== "running" && job.status !== "needs_input") continue;
+    if (!isLive(job.status)) continue;
 
     let pane;
     try {
@@ -224,7 +297,11 @@ function pollRunningJobs() {
 
     // Finishing takes priority over this — a prompt that got answered and
     // then exited shouldn't flicker back to "needs input" on its last poll.
-    job.status = needsInput(pane) ? "needs_input" : "running";
+    job.status = resolveLiveStatus({
+      mode: job.mode,
+      paneText: pane,
+      hookState: job.mode === "interactive" ? readHookState(job.id) : null,
+    });
   }
 }
 
@@ -286,7 +363,13 @@ export function startCommandJob({
       cwd,
       "bash",
       "-c",
-      innerCommand({ promptFile: promptFilePath(id), exitFile: exitFilePath(id), mode, extraArgs }),
+      innerCommand({
+        promptFile: promptFilePath(id),
+        exitFile: exitFilePath(id),
+        stateFile: stateFilePath(id),
+        mode,
+        extraArgs,
+      }),
     ]);
     // Without this, tmux kills the pane the instant the inner command exits —
     // attaching a few seconds late would show nothing, and the final output
@@ -325,10 +408,10 @@ export function listJobs() {
 // against a ticket that already has one in flight.
 export function findRunningJobForTicket(ticketKey) {
   for (const job of jobs.values()) {
-    // needs_input is still a live session (stuck, not done) — it should
-    // still block a second dispatch and still show the ticket row's
-    // jump-to-session button instead of reverting to "spawn".
-    if (job.ticketKey === ticketKey && (job.status === "running" || job.status === "needs_input")) {
+    // needs_input and idle are still live sessions (stuck or waiting, not
+    // done) — they should still block a second dispatch and still show the
+    // ticket row's jump-to-session button instead of reverting to "spawn".
+    if (job.ticketKey === ticketKey && isLive(job.status)) {
       return job;
     }
   }
@@ -447,7 +530,7 @@ export function closeJob(id) {
   const job = jobs.get(id);
   if (!job) return { ok: false, error: "Unknown job" };
 
-  // Always kill the tmux session, not just for running/needs_input jobs.
+  // Always kill the tmux session, not just for live jobs.
   // `remain-on-exit` deliberately keeps a finished job's pane alive (so a
   // human can still attach and read it) — closing a finished card without
   // killing it would leave that session an orphan with no job record, and
@@ -474,7 +557,7 @@ export function closeJob(id) {
   }
 
   jobs.delete(id);
-  for (const path of [promptFilePath(id), exitFilePath(id), metaFilePath(id)]) {
+  for (const path of [promptFilePath(id), exitFilePath(id), metaFilePath(id), stateFilePath(id)]) {
     try {
       unlinkSync(path);
     } catch {
@@ -493,5 +576,10 @@ export const __test__ = {
   idFromSessionName,
   innerCommand,
   needsInput,
+  isLive,
+  resolveLiveStatus,
+  hookSettings,
+  stateFilePath,
+  readHookState,
   syncJobsFromTmux,
 };

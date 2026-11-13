@@ -8,6 +8,7 @@
 
 import { useEffect, useState } from "react";
 import { StatusIcon } from "./StatusIcon.jsx";
+import { isLiveStatus } from "./jobStatus.js";
 
 function useOpenInIterm(jobId) {
   const [state, setState] = useState("idle"); // idle | opening | error
@@ -90,6 +91,11 @@ function SessionCard({ job, onClose }) {
         {job.status === "needs_input" && (
           <span className="session-needs-input">needs input</span>
         )}
+        {job.status === "idle" && (
+          <span className="session-idle" title="The agent stopped and is waiting for you — close it when you're done">
+            idle
+          </span>
+        )}
         {job.exitCode !== null && job.exitCode !== 0 && (
           <span className="session-exit">exit {job.exitCode}</span>
         )}
@@ -121,13 +127,13 @@ function SessionCard({ job, onClose }) {
 }
 
 export function SessionColumn({ jobs, onRefresh, onClose }) {
-  // needs_input is still unresolved, not done — keep polling it the same as
-  // running, so a session that gets unstuck (or times out) updates without
-  // a manual refresh.
-  const isLive = (j) => j.status === "running" || j.status === "needs_input";
+  // needs_input and idle are still unresolved, not done — keep polling them
+  // the same as running, so a session that gets unstuck (or is typed into
+  // again) updates without a manual refresh.
   const hasRunning = jobs.some((j) => j.status === "running");
   const hasNeedsInput = jobs.some((j) => j.status === "needs_input");
-  const hasLive = jobs.some(isLive);
+  const hasIdle = jobs.some((j) => j.status === "idle");
+  const hasLive = jobs.some((j) => isLiveStatus(j.status));
 
   useEffect(() => {
     if (!hasLive) return;
@@ -147,6 +153,9 @@ export function SessionColumn({ jobs, onRefresh, onClose }) {
           <span className="focus-column-live focus-column-live--needs-input">
             needs input
           </span>
+        )}
+        {hasIdle && (
+          <span className="focus-column-live focus-column-live--idle">idle</span>
         )}
       </div>
 

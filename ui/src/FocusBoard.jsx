@@ -15,6 +15,7 @@
 
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { latestOnly } from "./latestOnly.js";
+import { isLiveStatus } from "./jobStatus.js";
 import { TicketColumn } from "./TicketColumn.jsx";
 import { TodoColumn } from "./TodoColumn.jsx";
 import { PrColumn } from "./PrColumn.jsx";
@@ -221,12 +222,10 @@ export function FocusBoard() {
     };
   }, [fetchTickets, fetchJobs]);
 
-  // needs_input is stuck, not finished — only an actual running→done
-  // transition should trigger a refetch here (a ticket's activeJobId
-  // clearing), not a running→needs_input one.
-  const liveJobCount = jobs.filter(
-    (j) => j.status === "running" || j.status === "needs_input",
-  ).length;
+  // needs_input and idle are stuck or waiting, not finished — only an actual
+  // live→done transition should trigger a refetch here (a ticket's
+  // activeJobId clearing), not a running→needs_input or running→idle one.
+  const liveJobCount = jobs.filter((j) => isLiveStatus(j.status)).length;
   useEffect(() => {
     if (liveJobCount === 0 && jobs.length > 0) fetchTickets();
   }, [liveJobCount, jobs.length, fetchTickets]);
