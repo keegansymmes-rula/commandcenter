@@ -66,11 +66,17 @@ hasn't come.
 |---|---|
 | `running` | Working |
 | `needs_input` | Waiting on a permission prompt or question. Nothing moves until a human answers it, so tell the user and offer to open the terminal |
+| `idle` | Interactive only. The agent finished its turn and is sitting at the prompt with nothing pending. The session stays open until a human closes it. Flips back to `running` when someone types into it |
 | `succeeded` | Exited 0 (headless) |
 | `failed` | Exited non-zero, or its session ended unexpectedly. Read `log` and `error` before reporting |
 
-Interactive jobs stay `running` until a human closes them, even after the
-agent's work is done. Its `SendMessage` report is the signal it finished.
+Interactive jobs never reach `succeeded`: they go `idle` once the agent
+stops, then stay open until a human closes them. An `idle` job is waiting on
+the user, not stuck, but it can also mean the agent asked a question in plain
+text, so read `log` before calling the work done. Its `SendMessage` report is
+the signal it finished. A job started before `idle` existed keeps reporting
+`running`, and so does one the user interrupted with Esc (that skips the
+hook).
 
 `hasBrain: true` means the agent wrote to its Brain View canvas. The user can
 open it from the session's card in the dashboard.
@@ -91,5 +97,6 @@ curl -s -X POST "$API/api/jobs/$ID/close"
 ```
 
 This **kills a live agent** and removes the job from the list. Confirm with
-the user before closing anything `running` or `needs_input`. Closing a finished
+the user before closing anything `running`, `needs_input`, or `idle` (an idle
+session may still hold work the user wants to continue). Closing a finished
 job just tidies the list, so no confirmation is needed.

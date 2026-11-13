@@ -1,3 +1,7 @@
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { serializeJob, __test__ } from "../api/run-command.js";
 
@@ -8,6 +12,11 @@ const {
   idFromSessionName,
   innerCommand,
   needsInput,
+  isLive,
+  resolveLiveStatus,
+  hookSettings,
+  stateFilePath,
+  readHookState,
 } = __test__;
 
 describe("truncate", () => {
@@ -127,6 +136,123 @@ describe("needsInput", () => {
     const stale = "Do you want to proceed?\n❯ 1. Yes\n";
     const pane = stale + "x".repeat(3000) + "\nAll done, nothing pending.";
     expect(needsInput(pane)).toBe(false);
+  });
+});
+
+describe("resolveLiveStatus", () => {
+  const prompt = "Bash command\n  rm -rf dist/\n\nDo you want to proceed?\n❯ 1. Yes\n  2. No";
+  const calm = "All done. Anything else?\n";
+
+  it("is idle for an interactive session whose hooks say the agent stopped", () => {
+    expect(resolveLiveStatus({ mode: "interactive", paneText: calm, hookState: "idle" })).toBe("idle");
+  });
+
+  it("stays running while the hooks say the agent is working", () => {
+    expect(resolveLiveStatus({ mode: "interactive", paneText: calm, hookState: "running" })).toBe("running");
+  });
+
+  it("stays running when there is no hook state yet (session predates the hooks)", () => {
+    expect(resolveLiveStatus({ mode: "interactive", paneText: calm, hookState: null })).toBe("running");
+  });
+
+  it("keeps needs_input over idle when a prompt is on screen", () => {
+    expect(resolveLiveStatus({ mode: "interactive", paneText: prompt, hookState: "idle" })).toBe("needs_input");
+    expect(resolveLiveStatus({ mode: "interactive", paneText: prompt, hookState: "running" })).toBe("needs_input");
+  });
+
+  it("never reports idle for a headless job, whatever the hook state says", () => {
+    expect(resolveLiveStatus({ mode: "headless", paneText: calm, hookState: "idle" })).toBe("running");
+  });
+});
+
+describe("isLive", () => {
+  it.each(["running", "needs_input", "idle"])("treats %s as a live session", (status) => {
+    expect(isLive(status)).toBe(true);
+  });
+
+  it.each(["succeeded", "failed", undefined])("treats %s as finished", (status) => {
+    expect(isLive(status)).toBe(false);
+  });
+});
+
+describe("interactive hook state", () => {
+  let dir;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "cc-hooks-"));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // Runs a hook's command string the way Claude Code would: through a shell.
+  function runHook(settings, event) {
+    const [{ hooks }] = settings.hooks[event];
+    execFileSync("sh", ["-c", hooks[0].command]);
+  }
+
+  it("wires Stop to idle, and UserPromptSubmit and PreToolUse back to running", () => {
+    const stateFile = join(dir, "job.state");
+    const settings = JSON.parse(hookSettings(stateFile));
+
+    runHook(settings, "Stop");
+    expect(readFileSync(stateFile, "utf-8")).toBe("idle");
+
+    runHook(settings, "UserPromptSubmit");
+    expect(readFileSync(stateFile, "utf-8")).toBe("running");
+
+    runHook(settings, "Stop");
+    runHook(settings, "PreToolUse");
+    expect(readFileSync(stateFile, "utf-8")).toBe("running");
+  });
+
+  it("survives a state path with a space in it", () => {
+    const stateFile = join(dir, "with space.state");
+    runHook(JSON.parse(hookSettings(stateFile)), "Stop");
+    expect(readFileSync(stateFile, "utf-8")).toBe("idle");
+  });
+
+  it("passes the settings to claude as one intact argument for interactive jobs", () => {
+    const promptFile = join(dir, "job.prompt");
+    const stateFile = join(dir, "job.state");
+    writeFileSync(promptFile, "do the thing", "utf-8");
+
+    const cmd = innerCommand({ promptFile, exitFile: join(dir, "job.exit"), stateFile, mode: "interactive" });
+    // Stand in for the real binary: print each argument on its own line.
+    const out = execFileSync("bash", ["-c", `claude() { printf '%s\\n' "$@"; }; ${cmd}`], {
+      encoding: "utf-8",
+    }).split("\n");
+
+    const flag = out.indexOf("--settings");
+    expect(flag).toBeGreaterThan(-1);
+    expect(JSON.parse(out[flag + 1])).toEqual(JSON.parse(hookSettings(stateFile)));
+  });
+
+  it("does not add hooks to a headless job", () => {
+    const cmd = innerCommand({
+      promptFile: "/tmp/x.prompt",
+      exitFile: "/tmp/x.exit",
+      stateFile: "/tmp/x.state",
+      mode: "headless",
+    });
+    expect(cmd).not.toContain("--settings");
+  });
+
+  it("reads back only the two states the hooks write", () => {
+    const id = `test-${process.pid}-${Date.now()}`;
+    const path = stateFilePath(id);
+    try {
+      expect(readHookState(id)).toBeNull();
+      writeFileSync(path, "idle");
+      expect(readHookState(id)).toBe("idle");
+      writeFileSync(path, "running\n");
+      expect(readHookState(id)).toBe("running");
+      writeFileSync(path, "garbage");
+      expect(readHookState(id)).toBeNull();
+    } finally {
+      rmSync(path, { force: true });
+    }
   });
 });
 

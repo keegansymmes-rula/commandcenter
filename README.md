@@ -90,6 +90,12 @@ runs in the repo resolved from its labels or description, falling back to
 `DEV_ROOT`. `mode` is `headless` (the default) or `interactive`. One
 running job per ticket; a second dispatch returns 409.
 
+An interactive session shows `idle` once the agent stops at its prompt with
+nothing pending, and goes back to `running` when you type into it. The
+session reports this itself: each interactive dispatch carries per-session
+Stop/UserPromptSubmit/PreToolUse hooks (via `--settings`) that write a state
+file under the OS temp dir, which the status poll reads.
+
 Every dispatched prompt starts with `/automodel`
 (`commands/automodel.md`), so the agent picks haiku, sonnet, or opus for
 the task before starting it, and ends with an instruction to report back to
