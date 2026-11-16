@@ -740,11 +740,13 @@ export function closeJob(id) {
   }
 
   jobs.delete(id);
+  // relayClaimPath(id) is deliberately left behind: it is the at-most-once
+  // guard, and another API instance still holding this job would relay it
+  // again if the claim were gone along with the metadata.
   for (const path of [
     promptFilePath(id),
     exitFilePath(id),
     metaFilePath(id),
-    relayClaimPath(id),
     connectionErrorMarkerPath(id),
   ].filter(Boolean)) {
     try {

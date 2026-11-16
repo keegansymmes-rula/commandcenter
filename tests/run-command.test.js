@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { rmSync } from "node:fs";
+import { existsSync, rmSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { serializeJob, __test__ } from "../api/run-command.js";
 import { NOTICE_TAG } from "../api/lib/pearl-session.js";
@@ -149,6 +149,38 @@ describe("claimRelay", () => {
   it("raises on a failure that is not 'already claimed', so the relay aborts", () => {
     // A path under a directory that does not exist fails with ENOENT, not EEXIST.
     expect(() => claimRelay("missing-dir/nested/id")).toThrow();
+  });
+});
+
+describe("closeJob", () => {
+  afterEach(() => {
+    vi.doUnmock("node:child_process");
+    vi.resetModules();
+  });
+
+  it("keeps the relay claim, so a stale second API instance cannot relay the job again", async () => {
+    vi.doMock("node:child_process", () => ({
+      execFileSync: (cmd, args) => {
+        if (cmd === "tmux" && (args[0] === "list-sessions" || args[0] === "kill-session")) return "";
+        throw new Error(`unexpected execFileSync call in test: ${cmd} ${args.join(" ")}`);
+      },
+    }));
+    vi.resetModules();
+    const mod = await import("../api/run-command.js");
+    const t = mod.__test__;
+
+    const id = `close-test-${randomUUID()}`;
+    t.jobs.set(id, { id, mode: "headless", status: "succeeded", tmuxSession: `ccenter-${id}`, relay: null });
+    expect(t.claimRelay(id)).toBe(true);
+
+    try {
+      expect(mod.closeJob(id)).toEqual({ ok: true });
+      expect(t.jobs.has(id)).toBe(false);
+      expect(existsSync(t.relayClaimPath(id))).toBe(true);
+      expect(t.claimRelay(id)).toBe(false);
+    } finally {
+      rmSync(t.relayClaimPath(id), { force: true });
+    }
   });
 });
 
