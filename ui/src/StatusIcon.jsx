@@ -23,6 +23,14 @@ const ICONS = {
       <path d="M6.3 5.6v4.8M9.7 5.6v4.8" strokeLinecap="round" />
     </svg>
   ),
+  // Severed link — "lost the connection, waiting to be told to carry on."
+  connection_error: (
+    <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.4">
+      <path d="M6.6 4.8H5a3.2 3.2 0 0 0 0 6.4h1.6" strokeLinecap="round" />
+      <path d="M9.4 4.8H11a3.2 3.2 0 0 1 0 6.4H9.4" strokeLinecap="round" />
+      <path d="M2.6 13.4l10.8-10.8" strokeLinecap="round" />
+    </svg>
+  ),
   // Mission-complete badge: shield + check.
   succeeded: (
     <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.4">

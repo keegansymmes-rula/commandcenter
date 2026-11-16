@@ -96,11 +96,30 @@ function SessionCard({ job, onClose }) {
             idle
           </span>
         )}
+        {job.status === "connection_error" && (
+          <span
+            className="session-connection-error"
+            title="Claude Code lost its connection mid-response and is idle — open the terminal and tell it to continue"
+          >
+            connection lost
+          </span>
+        )}
         {job.exitCode !== null && job.exitCode !== 0 && (
           <span className="session-exit">exit {job.exitCode}</span>
         )}
         {state === "opening" && <span className="session-opening">opening…</span>}
       </button>
+      {job.status === "connection_error" && canOpen && (
+        <button
+          type="button"
+          className="session-attach"
+          title="Open this session's terminal so you can tell it to continue"
+          onClick={open}
+          disabled={state === "opening"}
+        >
+          ↗ continue
+        </button>
+      )}
       {job.hasBrain && (
         <a
           className="session-brain"
@@ -127,12 +146,13 @@ function SessionCard({ job, onClose }) {
 }
 
 export function SessionColumn({ jobs, onRefresh, onClose }) {
-  // needs_input and idle are still unresolved, not done — keep polling them
-  // the same as running, so a session that gets unstuck (or is typed into
-  // again) updates without a manual refresh.
+  // needs_input, idle and connection_error are still unresolved, not done —
+  // keep polling them the same as running, so a session that gets unstuck (or
+  // is typed into again, or times out) updates without a manual refresh.
   const hasRunning = jobs.some((j) => j.status === "running");
   const hasNeedsInput = jobs.some((j) => j.status === "needs_input");
   const hasIdle = jobs.some((j) => j.status === "idle");
+  const hasConnectionError = jobs.some((j) => j.status === "connection_error");
   const hasLive = jobs.some((j) => isLiveStatus(j.status));
 
   useEffect(() => {
@@ -156,6 +176,11 @@ export function SessionColumn({ jobs, onRefresh, onClose }) {
         )}
         {hasIdle && (
           <span className="focus-column-live focus-column-live--idle">idle</span>
+        )}
+        {hasConnectionError && (
+          <span className="focus-column-live focus-column-live--connection-error">
+            connection lost
+          </span>
         )}
       </div>
 

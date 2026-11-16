@@ -24,12 +24,33 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hasBrainContent } from "./brain.js";
-import { SESSION as PEARL_SESSION } from "./lib/pearl-session.js";
+import {
+  CONNECTION_ERROR_TEXT,
+  DIALOG_QUESTION,
+  chatPromptIsEmpty,
+  endsInConnectionError,
+  isAtChatPrompt,
+} from "./lib/pane.js";
+import { NOTICE_TAG, PEARL_NAME, SESSION as PEARL_SESSION } from "./lib/pearl-session.js";
+import {
+  findTranscript,
+  inputBoxIsEmpty,
+  readTranscriptTail,
+  relayIfUndelivered,
+  TMUX_TIMEOUT_MS,
+} from "./lib/report-relay.js";
 
 const MAX_LOG_CHARS = 100_000;
 const SESSION_PREFIX = "ccenter-";
 const JOBS_DIR = join(tmpdir(), "ccenter-jobs");
 const POLL_INTERVAL_MS = 2000;
+
+// Statuses where the tmux session is still alive and unresolved. needs_input
+// and connection_error are stuck, and idle is the agent stopped and waiting on
+// the human; none is done, so each still blocks a second dispatch and keeps
+// the ticket row's jump-to-session button. Mirrors LIVE_STATUSES in
+// ui/src/jobStatus.js.
+const LIVE_STATUSES = new Set(["running", "needs_input", "idle", "connection_error"]);
 
 mkdirSync(JOBS_DIR, { recursive: true });
 
@@ -57,7 +78,6 @@ function truncate(text) {
 // the binary, not guessed) is the more general signal on top of it — any
 // numbered choice sitting there with a selection cursor on it means
 // something is waiting on a keypress, independent of the exact wording.
-const NEEDS_INPUT_QUESTION = /Do you want to [^\n?]*\?/;
 const NEEDS_INPUT_MENU_CURSOR = /^\s*❯\s*\d+\./m;
 
 function hasMenuCursor(paneText) {
@@ -66,24 +86,37 @@ function hasMenuCursor(paneText) {
 
 function needsInput(paneText) {
   const tail = paneText.slice(-2000);
-  if (NEEDS_INPUT_QUESTION.test(tail)) return true;
+  if (DIALOG_QUESTION.test(tail)) return true;
   return NEEDS_INPUT_MENU_CURSOR.test(tail);
 }
-
-// A job whose tmux session is still up. idle is live too: the agent stopped
-// but the session is open, and closing it is still the human's call.
-const LIVE_STATUSES = new Set(["running", "needs_input", "idle"]);
 
 function isLive(status) {
   return LIVE_STATUSES.has(status);
 }
 
+// A Claude Code API failure ("API Error: Connection lost mid-response") ends
+// the turn and leaves the agent idle at its prompt: no exit code, no
+// permission dialog, and the agent never reports because it believes it is
+// waiting for the user. It is a status of its own (not a flag on "running")
+// because every consumer already branches on status. needsInput() above looks
+// for a dialog anywhere in the tail, so an old dialog still on screen matches
+// it too; the poll therefore asks this first. It is true only when the error is
+// the newest thing in the pane, which a newer dialog is not. The text matching
+// and "is it still the latest state" rules live in lib/pane.js.
+function connectionError(paneText) {
+  return endsInConnectionError(paneText);
+}
+
 // What a live job's status should be, given its pane and (interactive only)
-// the state its own hooks last wrote. needs_input wins over idle on purpose:
-// a prompt on screen is the more urgent fact, and the pane check is the only
-// signal that can see one. Hooks alone can't tell "stopped" from "blocked on a
-// permission dialog" — the Stop hook never fires for a turn that's still
-// waiting on one, so the state stays "running" there and the pane decides.
+// the state its own hooks last wrote. A connection error is checked first: it
+// is only true when the error is the newest thing in the pane, and it is the
+// more specific fact whether or not a Stop hook also fired after it.
+//
+// After that, needs_input wins over idle on purpose: a prompt on screen is the
+// more urgent fact, and the pane check is the only signal that can see one.
+// Hooks alone can't tell "stopped" from "blocked on a permission dialog" — the
+// Stop hook never fires for a turn that's still waiting on one, so the state
+// stays "running" there and the pane decides.
 //
 // Once Stop has fired, though, the agent's own closing message is the last
 // thing on screen, and it can contain "Do you want to ...?" as plain prose.
@@ -91,6 +124,7 @@ function isLive(status) {
 // "❯ 1." cursor), which prose doesn't produce, e.g. a menu the user opened
 // with a slash command.
 function resolveLiveStatus({ mode, paneText, hookState }) {
+  if (connectionError(paneText)) return "connection_error";
   if (mode === "interactive" && hookState === "idle") {
     return hasMenuCursor(paneText) ? "needs_input" : "idle";
   }
@@ -156,6 +190,22 @@ function hookSettings(stateFile) {
   });
 }
 
+function relayClaimPath(id) {
+  return join(JOBS_DIR, `${id}.relay`);
+}
+
+// Present while the supervisor has been told about the job's current
+// connection error (or we gave up trying). On disk rather than on the job so
+// an API restart (`node --watch` restarts on every edit) does not re-announce
+// a session that is still stuck. Ids come from tmux session names, which can
+// hold anything, so an id outside SAFE_ID gets no marker (null) rather than a
+// path that could leave JOBS_DIR.
+const SAFE_ID = /^[A-Za-z0-9-]+$/;
+
+function connectionErrorMarkerPath(id) {
+  return SAFE_ID.test(id) ? join(JOBS_DIR, `${id}.connection-error`) : null;
+}
+
 // The only shell-interpolated parts are paths we generated ourselves
 // (uuid-based, no quotes/spaces) — the arbitrary user prompt text goes
 // through `cat` on a file, never through shell string interpolation, so it
@@ -179,11 +229,16 @@ function hookSettings(stateFile) {
 // extraArgs is a pre-quoted string fragment (e.g. `--add-dir '/path'`), not
 // an array — it's spliced into a shell string built by this same function,
 // so the caller quotes it the same way promptFile/exitFile already are.
-function innerCommand({ promptFile, exitFile, stateFile, mode, extraArgs = "" }) {
+//
+// An interactive session is started with a --session-id we choose, so its
+// transcript path is known up front (~/.claude/projects/*/<id>.jsonl) and
+// report-relay.js can read it without guessing which session is whose.
+function innerCommand({ promptFile, exitFile, stateFile, mode, extraArgs = "", sessionId }) {
   const suffix = extraArgs ? ` ${extraArgs}` : "";
   if (mode === "interactive") {
+    const session = sessionId ? ` --session-id ${sessionId}` : "";
     const hooks = stateFile ? ` --settings '${hookSettings(stateFile)}'` : "";
-    return `claude "$(cat '${promptFile}')" --permission-mode auto${hooks}${suffix}`;
+    return `claude "$(cat '${promptFile}')" --permission-mode auto${session}${hooks}${suffix}`;
   }
   return `claude -p "$(cat '${promptFile}')" --permission-mode auto${suffix}; echo $? > '${exitFile}'`;
 }
@@ -203,6 +258,30 @@ function readMetaFile(id) {
   } catch {
     return null;
   }
+}
+
+// The one thing that makes a relay at-most-once: creating the file fails if it
+// already exists, atomically, so of two API processes (DASHBOARD_PORT allows
+// it) or two polls only one gets to paste. EEXIST means someone else holds it;
+// any other error propagates so the relay aborts instead of sending unclaimed.
+function claimRelay(id) {
+  try {
+    writeFileSync(relayClaimPath(id), String(process.pid), { flag: "wx" });
+    return true;
+  } catch (err) {
+    if (err.code === "EEXIST") return false;
+    throw err;
+  }
+}
+
+// Read-modify-write so persisting the relay state doesn't clobber the rest of
+// the recovery metadata. This is the displayed outcome, not the guard: a lost
+// write here can't cause a second paste, because the claim file already exists. A job adopted without a meta file has no session id
+// and is never relayed, so there is nothing to merge into.
+function persistRelay(job) {
+  const meta = readMetaFile(job.id);
+  if (!meta) return;
+  writeMetaFile(job.id, { ...meta, relay: job.relay });
 }
 
 function listLiveSessionNames() {
@@ -248,6 +327,8 @@ function syncJobsFromTmux() {
       prompt: meta?.prompt ?? "(tmux session adopted — no local metadata)",
       cwd: meta?.cwd ?? null,
       mode: meta?.mode ?? "headless",
+      sessionId: meta?.sessionId ?? null,
+      relay: meta?.relay ?? null,
       tmuxSession: session,
       status: "running",
       startedAt: meta?.startedAt ?? null,
@@ -259,11 +340,177 @@ function syncJobsFromTmux() {
   }
 }
 
+// What the supervisor's terminal can take right now. "busy" covers both a
+// question on screen (typing would answer it) and text already in the input
+// box (pasting would splice into it), and also a tmux call that timed out, so
+// the caller retries rather than giving up on a transient hiccup.
+function supervisorState() {
+  try {
+    execFileSync("tmux", ["has-session", "-t", PEARL_SESSION], {
+      stdio: "ignore",
+      timeout: TMUX_TIMEOUT_MS,
+    });
+  } catch (err) {
+    return err.code === "ETIMEDOUT" ? "busy" : "absent";
+  }
+  try {
+    const pane = execFileSync("tmux", ["capture-pane", "-t", PEARL_SESSION, "-p"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: TMUX_TIMEOUT_MS,
+    });
+    return needsInput(pane) || !inputBoxIsEmpty(pane) ? "busy" : "ready";
+  } catch {
+    return "busy";
+  }
+}
+
+// Types into the supervisor's terminal, which pearl.js deliberately avoids
+// for driving her (a TUI can't be typed into blind). It is acceptable here
+// because supervisorState() has just confirmed she is at an empty prompt, and
+// the text is a single sanitized line. A bracketed paste plus Enter in one tmux
+// invocation, so nothing can interleave between the paste and the submit.
+function deliverToSupervisor(message) {
+  const buffer = `ccrelay-${process.pid}`;
+  execFileSync("tmux", ["load-buffer", "-b", buffer, "-"], {
+    input: message,
+    stdio: ["pipe", "ignore", "ignore"],
+    timeout: TMUX_TIMEOUT_MS,
+  });
+  execFileSync(
+    "tmux",
+    ["paste-buffer", "-p", "-d", "-b", buffer, "-t", PEARL_SESSION, ";", "send-keys", "-t", PEARL_SESSION, "Enter"],
+    { stdio: "ignore", timeout: TMUX_TIMEOUT_MS },
+  );
+}
+
+const relayDeps = {
+  supervisorName: PEARL_NAME,
+  now: () => Date.now(),
+  readPersisted: readMetaFile,
+  persist: persistRelay,
+  claim: claimRelay,
+  locateTranscript: findTranscript,
+  readTranscript: readTranscriptTail,
+  supervisorState,
+  deliver: deliverToSupervisor,
+  log: (message) => console.warn(`[relay] ${message}`),
+};
+
+// A relay is a courtesy on top of polling and closing, never part of them: any
+// failure here is logged and swallowed so it can't stop a job from being
+// polled or closed.
+function tryRelay(job, options) {
+  try {
+    return relayIfUndelivered(job, relayDeps, options);
+  } catch (err) {
+    console.warn(`[relay] job ${job.id}: ${err.message}`);
+    return "error";
+  }
+}
+
 function finish(job, { exitCode, error }) {
   job.exitCode = exitCode;
   job.error = error ?? job.error;
   job.status = exitCode === 0 ? "succeeded" : "failed";
   job.finishedAt = new Date().toISOString();
+}
+
+// Retries stop after ~1 minute of polls: a supervisor that is stuck on a
+// dialog for longer than that is already asking for the human, and the
+// session still shows connection_error in the dashboard and /api/jobs.
+const NOTICE_MAX_ATTEMPTS = 30;
+const TICKET_KEY = /^[A-Z][A-Z0-9]+-\d+$/;
+
+// Fixed text plus the job id (and a ticket key only if it has the Jira key
+// shape). The title and prompt are deliberately left out: they come from
+// Jira and the user, and this string is typed into a supervisor agent's
+// input as if the user had written it. NOTICE_TAG is how she tells it apart.
+function connectionErrorNotice(job) {
+  const ticket = job.ticketKey && TICKET_KEY.test(job.ticketKey) ? ` (${job.ticketKey})` : "";
+  return (
+    `${NOTICE_TAG} Agent session ${job.id}${ticket} hit "${CONNECTION_ERROR_TEXT}" ` +
+    `and is idle at its prompt; its job status is connection_error. Tell the user, and offer to ` +
+    `open its terminal (POST /api/jobs/${job.id}/open-terminal) so they can tell it to continue. ` +
+    `This is a one-time notice for this error, so don't poll for it.`
+  );
+}
+
+// The only server-to-supervisor channel is typing into her tmux pane (the
+// approach pearl-speak.js uses for voice), which is only safe at an empty,
+// framed chat prompt. Anywhere else (a dialog, a half-written draft, no
+// session) this declines and the caller retries on the next poll.
+function sendNoticeToSupervisor(text) {
+  try {
+    const pane = execFileSync("tmux", ["capture-pane", "-t", PEARL_SESSION, "-p"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: TMUX_TIMEOUT_MS,
+    });
+    if (!isAtChatPrompt(pane) || !chatPromptIsEmpty(pane)) return false;
+
+    // One tmux invocation (`;` separates commands) so a failure cannot leave
+    // the text typed without the Enter.
+    execFileSync(
+      "tmux",
+      ["send-keys", "-t", PEARL_SESSION, "-l", text, ";", "send-keys", "-t", PEARL_SESSION, "Enter"],
+      { stdio: "ignore", timeout: TMUX_TIMEOUT_MS },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// One notice per occurrence: once the supervisor has been told (or we gave
+// up) that is recorded on the job and in the marker file, and both are
+// cleared as soon as the job leaves connection_error, so a later, separate
+// error announces itself again. The in-memory flag is what holds if the
+// marker cannot be written (jobs dir gone, disk full); the file only carries
+// the state across an API restart.
+function trackConnectionError(job) {
+  const marker = connectionErrorMarkerPath(job.id);
+
+  if (job.status !== "connection_error") {
+    job.noticeAttempts = 0;
+    job.noticeDone = false;
+    // existsSync first: this runs for every live job on every poll, and
+    // almost always there is nothing to remove.
+    if (marker && existsSync(marker)) {
+      try {
+        unlinkSync(marker);
+      } catch {
+        // Best-effort; worst case the next occurrence is not announced.
+      }
+    }
+    return;
+  }
+
+  if (job.noticeDone || (marker && existsSync(marker))) {
+    job.noticeDone = true;
+    return;
+  }
+
+  job.noticeAttempts = (job.noticeAttempts ?? 0) + 1;
+  const deliverable = SAFE_ID.test(job.id);
+  if (deliverable && sendNoticeToSupervisor(connectionErrorNotice(job))) {
+    job.noticeDone = true;
+    writeMarker(marker, "notified");
+  } else if (!deliverable || job.noticeAttempts >= NOTICE_MAX_ATTEMPTS) {
+    console.warn(`connection_error notice for job ${job.id} not delivered; giving up`);
+    job.noticeDone = true;
+    writeMarker(marker, "gave up");
+  }
+}
+
+function writeMarker(path, content) {
+  if (!path) return;
+  try {
+    writeFileSync(path, `${content} ${new Date().toISOString()}\n`, "utf-8");
+  } catch {
+    // Dedupe across an API restart is lost; within this process the job's
+    // noticeDone flag still holds. Not worth failing the poll over.
+  }
 }
 
 function pollRunningJobs() {
@@ -297,11 +544,23 @@ function pollRunningJobs() {
 
     // Finishing takes priority over this — a prompt that got answered and
     // then exited shouldn't flicker back to "needs input" on its last poll.
+    // Between the stuck states, whichever is latest in the pane wins:
+    // connectionError() is true only when nothing (a dialog included) follows
+    // the error, and needsInput() alone cannot tell an old dialog from a live
+    // one, so resolveLiveStatus asks the connection error first.
     job.status = resolveLiveStatus({
       mode: job.mode,
       paneText: pane,
       hookState: job.mode === "interactive" ? readHookState(job.id) : null,
     });
+    trackConnectionError(job);
+    // A "running" or "idle" job is relayed: idle is exactly the session that
+    // stopped its turn, which is the one that may have ended without reporting
+    // (relayIfUndelivered checks the transcript, not this status). Skipping
+    // idle would leave the relay firing only at close. connection_error
+    // already has its own supervisor notice, and needs_input is waiting on a
+    // human.
+    if (job.status === "running" || job.status === "idle") tryRelay(job);
   }
 }
 
@@ -332,6 +591,7 @@ export function startCommandJob({
   extraArgs = "",
 }) {
   const session = sessionNameFor(id);
+  const sessionId = mode === "interactive" ? randomUUID() : null;
 
   const job = {
     id,
@@ -340,6 +600,8 @@ export function startCommandJob({
     prompt,
     cwd,
     mode,
+    sessionId,
+    relay: null,
     tmuxSession: session,
     status: "running",
     startedAt: now,
@@ -351,7 +613,7 @@ export function startCommandJob({
   jobs.set(id, job);
 
   writeFileSync(promptFilePath(id), prompt, "utf-8");
-  writeMetaFile(id, { id, ticketKey, title, prompt, cwd, mode, startedAt: now });
+  writeMetaFile(id, { id, ticketKey, title, prompt, cwd, mode, sessionId, startedAt: now });
 
   try {
     execFileSync("tmux", [
@@ -369,6 +631,7 @@ export function startCommandJob({
         stateFile: stateFilePath(id),
         mode,
         extraArgs,
+        sessionId,
       }),
     ]);
     // Without this, tmux kills the pane the instant the inner command exits —
@@ -390,7 +653,9 @@ export function startCommandJob({
 // agent actually wrote to it, not whether one exists.
 export function serializeJob(job, { includeLog = false } = {}) {
   if (!job) return null;
-  const { log, ...rest } = job;
+  // noticeAttempts / noticeDone are poller bookkeeping, not part of the job's
+  // API shape.
+  const { log, noticeAttempts, noticeDone, ...rest } = job;
   const withBrain = { ...rest, hasBrain: hasBrainContent(job.id) };
   return includeLog ? { ...withBrain, log } : withBrain;
 }
@@ -408,9 +673,10 @@ export function listJobs() {
 // against a ticket that already has one in flight.
 export function findRunningJobForTicket(ticketKey) {
   for (const job of jobs.values()) {
-    // needs_input and idle are still live sessions (stuck or waiting, not
-    // done) — they should still block a second dispatch and still show the
-    // ticket row's jump-to-session button instead of reverting to "spawn".
+    // needs_input, idle and connection_error are still live sessions (stuck
+    // or waiting, not done) — they should still block a second dispatch and
+    // still show the ticket row's jump-to-session button instead of reverting
+    // to "spawn".
     if (job.ticketKey === ticketKey && isLive(job.status)) {
       return job;
     }
@@ -530,6 +796,11 @@ export function closeJob(id) {
   const job = jobs.get(id);
   if (!job) return { ok: false, error: "Unknown job" };
 
+  // Last chance to tell the supervisor what an idle session said: once the
+  // job is deleted below, nothing will. Only acts on a session that finished
+  // its turn without reporting; a working or needs_input one is left alone.
+  tryRelay(job, { closing: true });
+
   // Always kill the tmux session, not just for live jobs.
   // `remain-on-exit` deliberately keeps a finished job's pane alive (so a
   // human can still attach and read it) — closing a finished card without
@@ -557,7 +828,16 @@ export function closeJob(id) {
   }
 
   jobs.delete(id);
-  for (const path of [promptFilePath(id), exitFilePath(id), metaFilePath(id), stateFilePath(id)]) {
+  // relayClaimPath(id) is deliberately left behind: it is the at-most-once
+  // guard, and another API instance still holding this job would relay it
+  // again if the claim were gone along with the metadata.
+  for (const path of [
+    promptFilePath(id),
+    exitFilePath(id),
+    metaFilePath(id),
+    stateFilePath(id),
+    connectionErrorMarkerPath(id),
+  ].filter(Boolean)) {
     try {
       unlinkSync(path);
     } catch {
@@ -581,5 +861,17 @@ export const __test__ = {
   hookSettings,
   stateFilePath,
   readHookState,
+  connectionError,
+  connectionErrorMarkerPath,
+  connectionErrorNotice,
+  pollRunningJobs,
   syncJobsFromTmux,
+  supervisorState,
+  deliverToSupervisor,
+  persistRelay,
+  claimRelay,
+  relayClaimPath,
+  tryRelay,
+  NOTICE_MAX_ATTEMPTS,
+  LIVE_STATUSES,
 };

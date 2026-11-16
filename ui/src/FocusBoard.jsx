@@ -222,9 +222,10 @@ export function FocusBoard() {
     };
   }, [fetchTickets, fetchJobs]);
 
-  // needs_input and idle are stuck or waiting, not finished — only an actual
-  // live→done transition should trigger a refetch here (a ticket's
-  // activeJobId clearing), not a running→needs_input or running→idle one.
+  // needs_input, idle and connection_error are stuck or waiting, not
+  // finished — only an actual live→done transition should trigger a refetch
+  // here (a ticket's activeJobId clearing), not a running→needs_input,
+  // running→idle or running→connection_error one.
   const liveJobCount = jobs.filter((j) => isLiveStatus(j.status)).length;
   useEffect(() => {
     if (liveJobCount === 0 && jobs.length > 0) fetchTickets();

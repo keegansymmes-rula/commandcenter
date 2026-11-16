@@ -597,7 +597,13 @@ app.post("/api/dispatch", async (request, reply) => {
   // wedged on a permission dialog can't execute this instruction either.
   // The instruction itself stays inline so it holds even if /cc-report never
   // loads; the skill only covers how to word the report.
-  composedPrompt = `${composedPrompt}\n\n---\n\nWhen you finish — done, failed, or stopping because you're blocked — send ${PEARL_NAME} a brief status via the SendMessage tool: one or two sentences on what happened and whether anything needs human attention. Don't wait for a reply. /cc-report covers what to include.`;
+  //
+  // The auto mode classifier sometimes denies SendMessage, and a session that
+  // obeys the denial just stops. Retrying once covers a one-off block; the
+  // UNDELIVERED fallback puts the report in the pane for the user and makes
+  // it the session's last message, which is what run-command.js relays to
+  // Pearl when no report got through.
+  composedPrompt = `${composedPrompt}\n\n---\n\nWhen you finish — done, failed, or stopping because you're blocked — send ${PEARL_NAME} a brief status via the SendMessage tool: one or two sentences on what happened and whether anything needs human attention. Don't wait for a reply. If SendMessage is denied or errors, retry once; if that fails too, start your final output with "UNDELIVERED to ${PEARL_NAME}:" followed by the same status. /cc-report covers what to include.`;
 
   if (!cwd) {
     reply.code(400);
