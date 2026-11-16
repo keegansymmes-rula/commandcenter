@@ -46,9 +46,11 @@ const JOBS_DIR = join(tmpdir(), "ccenter-jobs");
 const POLL_INTERVAL_MS = 2000;
 
 // Statuses where the tmux session is still alive and unresolved. needs_input
-// and connection_error are stuck, not done, so they still block a second
-// dispatch and keep the ticket row's jump-to-session button.
-const LIVE_STATUSES = new Set(["running", "needs_input", "connection_error"]);
+// and connection_error are stuck, and idle is the agent stopped and waiting on
+// the human; none is done, so each still blocks a second dispatch and keeps
+// the ticket row's jump-to-session button. Mirrors LIVE_STATUSES in
+// ui/src/jobStatus.js.
+const LIVE_STATUSES = new Set(["running", "needs_input", "idle", "connection_error"]);
 
 mkdirSync(JOBS_DIR, { recursive: true });
 
@@ -78,10 +80,18 @@ function truncate(text) {
 // something is waiting on a keypress, independent of the exact wording.
 const NEEDS_INPUT_MENU_CURSOR = /^\s*❯\s*\d+\./m;
 
+function hasMenuCursor(paneText) {
+  return NEEDS_INPUT_MENU_CURSOR.test(paneText.slice(-2000));
+}
+
 function needsInput(paneText) {
   const tail = paneText.slice(-2000);
   if (DIALOG_QUESTION.test(tail)) return true;
   return NEEDS_INPUT_MENU_CURSOR.test(tail);
+}
+
+function isLive(status) {
+  return LIVE_STATUSES.has(status);
 }
 
 // A Claude Code API failure ("API Error: Connection lost mid-response") ends
@@ -95,6 +105,30 @@ function needsInput(paneText) {
 // and "is it still the latest state" rules live in lib/pane.js.
 function connectionError(paneText) {
   return endsInConnectionError(paneText);
+}
+
+// What a live job's status should be, given its pane and (interactive only)
+// the state its own hooks last wrote. A connection error is checked first: it
+// is only true when the error is the newest thing in the pane, and it is the
+// more specific fact whether or not a Stop hook also fired after it.
+//
+// After that, needs_input wins over idle on purpose: a prompt on screen is the
+// more urgent fact, and the pane check is the only signal that can see one.
+// Hooks alone can't tell "stopped" from "blocked on a permission dialog" — the
+// Stop hook never fires for a turn that's still waiting on one, so the state
+// stays "running" there and the pane decides.
+//
+// Once Stop has fired, though, the agent's own closing message is the last
+// thing on screen, and it can contain "Do you want to ...?" as plain prose.
+// So an idle session only counts as needs_input for a rendered menu (the
+// "❯ 1." cursor), which prose doesn't produce, e.g. a menu the user opened
+// with a slash command.
+function resolveLiveStatus({ mode, paneText, hookState }) {
+  if (connectionError(paneText)) return "connection_error";
+  if (mode === "interactive" && hookState === "idle") {
+    return hasMenuCursor(paneText) ? "needs_input" : "idle";
+  }
+  return needsInput(paneText) ? "needs_input" : "running";
 }
 
 function sessionNameFor(id) {
@@ -115,6 +149,45 @@ function exitFilePath(id) {
 
 function metaFilePath(id) {
   return join(JOBS_DIR, `${id}.meta.json`);
+}
+
+function stateFilePath(id) {
+  return join(JOBS_DIR, `${id}.state`);
+}
+
+// "idle" or "running", as last written by the session's own hooks; null when
+// the file doesn't exist (headless job, or an interactive one started before
+// these hooks existed) or holds anything else.
+function readHookState(id) {
+  try {
+    const state = readFileSync(stateFilePath(id), "utf-8").trim();
+    return state === "idle" || state === "running" ? state : null;
+  } catch {
+    return null;
+  }
+}
+
+// Interactive sessions report their own turn boundaries through Claude Code
+// hooks, scoped to this one session via --settings (an additional settings
+// source, same trick as Pearl's speech hook in pearl.js) so nothing in
+// ~/.claude/settings.json is touched. Stop fires when the agent finishes its
+// turn and sits at the prompt; UserPromptSubmit fires the moment the human
+// types again. PreToolUse also flips back to running because another Stop
+// hook can block a stop and make the agent carry on without any new prompt;
+// without it the card would read idle while work continues. The command
+// quotes the path with double quotes (escaped by JSON.stringify) so the whole
+// settings blob can sit inside single quotes in the shell string.
+function hookSettings(stateFile) {
+  const write = (state) => ({
+    hooks: [{ type: "command", command: `printf ${state} > "${stateFile}"` }],
+  });
+  return JSON.stringify({
+    hooks: {
+      Stop: [write("idle")],
+      UserPromptSubmit: [write("running")],
+      PreToolUse: [write("running")],
+    },
+  });
 }
 
 function relayClaimPath(id) {
@@ -145,7 +218,9 @@ function connectionErrorMarkerPath(id) {
 // deliberately no exit-code capture for interactive — it isn't "done" when
 // Claude's reply finishes, only when the human closes it (or exits the
 // shell themselves, which the existing "tmux session ended" handling in
-// pollRunningJobs already covers, just without a numeric exit code).
+// pollRunningJobs already covers, just without a numeric exit code). What it
+// does get is hookSettings' state file, so the dashboard can tell "agent
+// stopped, waiting on the human" (idle) from "agent working" (running).
 //
 // --permission-mode auto (not acceptEdits) — same mode Pearl runs in, so
 // every spawned agent (headless, interactive, or Pearl herself) behaves
@@ -158,11 +233,12 @@ function connectionErrorMarkerPath(id) {
 // An interactive session is started with a --session-id we choose, so its
 // transcript path is known up front (~/.claude/projects/*/<id>.jsonl) and
 // report-relay.js can read it without guessing which session is whose.
-function innerCommand({ promptFile, exitFile, mode, extraArgs = "", sessionId }) {
+function innerCommand({ promptFile, exitFile, stateFile, mode, extraArgs = "", sessionId }) {
   const suffix = extraArgs ? ` ${extraArgs}` : "";
   if (mode === "interactive") {
     const session = sessionId ? ` --session-id ${sessionId}` : "";
-    return `claude "$(cat '${promptFile}')" --permission-mode auto${session}${suffix}`;
+    const hooks = stateFile ? ` --settings '${hookSettings(stateFile)}'` : "";
+    return `claude "$(cat '${promptFile}')" --permission-mode auto${session}${hooks}${suffix}`;
   }
   return `claude -p "$(cat '${promptFile}')" --permission-mode auto${suffix}; echo $? > '${exitFile}'`;
 }
@@ -441,7 +517,7 @@ function pollRunningJobs() {
   syncJobsFromTmux();
 
   for (const job of jobs.values()) {
-    if (!LIVE_STATUSES.has(job.status)) continue;
+    if (!isLive(job.status)) continue;
 
     let pane;
     try {
@@ -468,19 +544,23 @@ function pollRunningJobs() {
 
     // Finishing takes priority over this — a prompt that got answered and
     // then exited shouldn't flicker back to "needs input" on its last poll.
-    // Between the two stuck states, whichever is latest in the pane wins:
+    // Between the stuck states, whichever is latest in the pane wins:
     // connectionError() is true only when nothing (a dialog included) follows
     // the error, and needsInput() alone cannot tell an old dialog from a live
-    // one, so it must not be asked first.
-    job.status = connectionError(pane)
-      ? "connection_error"
-      : needsInput(pane)
-        ? "needs_input"
-        : "running";
+    // one, so resolveLiveStatus asks the connection error first.
+    job.status = resolveLiveStatus({
+      mode: job.mode,
+      paneText: pane,
+      hookState: job.mode === "interactive" ? readHookState(job.id) : null,
+    });
     trackConnectionError(job);
-    // Only a plain "running" job is relayed: connection_error already has its
-    // own supervisor notice, and needs_input is waiting on a human.
-    if (job.status === "running") tryRelay(job);
+    // A "running" or "idle" job is relayed: idle is exactly the session that
+    // stopped its turn, which is the one that may have ended without reporting
+    // (relayIfUndelivered checks the transcript, not this status). Skipping
+    // idle would leave the relay firing only at close. connection_error
+    // already has its own supervisor notice, and needs_input is waiting on a
+    // human.
+    if (job.status === "running" || job.status === "idle") tryRelay(job);
   }
 }
 
@@ -545,7 +625,14 @@ export function startCommandJob({
       cwd,
       "bash",
       "-c",
-      innerCommand({ promptFile: promptFilePath(id), exitFile: exitFilePath(id), mode, extraArgs, sessionId }),
+      innerCommand({
+        promptFile: promptFilePath(id),
+        exitFile: exitFilePath(id),
+        stateFile: stateFilePath(id),
+        mode,
+        extraArgs,
+        sessionId,
+      }),
     ]);
     // Without this, tmux kills the pane the instant the inner command exits —
     // attaching a few seconds late would show nothing, and the final output
@@ -586,10 +673,11 @@ export function listJobs() {
 // against a ticket that already has one in flight.
 export function findRunningJobForTicket(ticketKey) {
   for (const job of jobs.values()) {
-    // needs_input / connection_error are still live sessions (stuck, not
-    // done) — they should still block a second dispatch and still show the
-    // ticket row's jump-to-session button instead of reverting to "spawn".
-    if (job.ticketKey === ticketKey && LIVE_STATUSES.has(job.status)) {
+    // needs_input, idle and connection_error are still live sessions (stuck
+    // or waiting, not done) — they should still block a second dispatch and
+    // still show the ticket row's jump-to-session button instead of reverting
+    // to "spawn".
+    if (job.ticketKey === ticketKey && isLive(job.status)) {
       return job;
     }
   }
@@ -713,7 +801,7 @@ export function closeJob(id) {
   // its turn without reporting; a working or needs_input one is left alone.
   tryRelay(job, { closing: true });
 
-  // Always kill the tmux session, not just for running/needs_input jobs.
+  // Always kill the tmux session, not just for live jobs.
   // `remain-on-exit` deliberately keeps a finished job's pane alive (so a
   // human can still attach and read it) — closing a finished card without
   // killing it would leave that session an orphan with no job record, and
@@ -747,6 +835,7 @@ export function closeJob(id) {
     promptFilePath(id),
     exitFilePath(id),
     metaFilePath(id),
+    stateFilePath(id),
     connectionErrorMarkerPath(id),
   ].filter(Boolean)) {
     try {
@@ -767,6 +856,11 @@ export const __test__ = {
   idFromSessionName,
   innerCommand,
   needsInput,
+  isLive,
+  resolveLiveStatus,
+  hookSettings,
+  stateFilePath,
+  readHookState,
   connectionError,
   connectionErrorMarkerPath,
   connectionErrorNotice,

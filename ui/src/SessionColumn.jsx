@@ -8,7 +8,7 @@
 
 import { useEffect, useState } from "react";
 import { StatusIcon } from "./StatusIcon.jsx";
-import { LIVE_STATUSES } from "./jobStatus.js";
+import { isLiveStatus } from "./jobStatus.js";
 
 function useOpenInIterm(jobId) {
   const [state, setState] = useState("idle"); // idle | opening | error
@@ -91,6 +91,11 @@ function SessionCard({ job, onClose }) {
         {job.status === "needs_input" && (
           <span className="session-needs-input">needs input</span>
         )}
+        {job.status === "idle" && (
+          <span className="session-idle" title="The agent stopped and is waiting for you — close it when you're done">
+            idle
+          </span>
+        )}
         {job.status === "connection_error" && (
           <span
             className="session-connection-error"
@@ -141,14 +146,14 @@ function SessionCard({ job, onClose }) {
 }
 
 export function SessionColumn({ jobs, onRefresh, onClose }) {
-  // needs_input and connection_error are still unresolved, not done — keep
-  // polling them the same as running, so a session that gets unstuck (or
-  // times out) updates without a manual refresh.
-  const isLive = (j) => LIVE_STATUSES.includes(j.status);
+  // needs_input, idle and connection_error are still unresolved, not done —
+  // keep polling them the same as running, so a session that gets unstuck (or
+  // is typed into again, or times out) updates without a manual refresh.
   const hasRunning = jobs.some((j) => j.status === "running");
   const hasNeedsInput = jobs.some((j) => j.status === "needs_input");
+  const hasIdle = jobs.some((j) => j.status === "idle");
   const hasConnectionError = jobs.some((j) => j.status === "connection_error");
-  const hasLive = jobs.some(isLive);
+  const hasLive = jobs.some((j) => isLiveStatus(j.status));
 
   useEffect(() => {
     if (!hasLive) return;
@@ -168,6 +173,9 @@ export function SessionColumn({ jobs, onRefresh, onClose }) {
           <span className="focus-column-live focus-column-live--needs-input">
             needs input
           </span>
+        )}
+        {hasIdle && (
+          <span className="focus-column-live focus-column-live--idle">idle</span>
         )}
         {hasConnectionError && (
           <span className="focus-column-live focus-column-live--connection-error">

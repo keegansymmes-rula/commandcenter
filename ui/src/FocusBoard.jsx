@@ -15,11 +15,11 @@
 
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { latestOnly } from "./latestOnly.js";
+import { isLiveStatus } from "./jobStatus.js";
 import { TicketColumn } from "./TicketColumn.jsx";
 import { TodoColumn } from "./TodoColumn.jsx";
 import { PrColumn } from "./PrColumn.jsx";
 import { SessionColumn } from "./SessionColumn.jsx";
-import { LIVE_STATUSES } from "./jobStatus.js";
 import { DispatchBar } from "./DispatchBar.jsx";
 import { DispatchModeDialog } from "./DispatchModeDialog.jsx";
 import { PearlButton } from "./PearlButton.jsx";
@@ -222,10 +222,11 @@ export function FocusBoard() {
     };
   }, [fetchTickets, fetchJobs]);
 
-  // needs_input / connection_error are stuck, not finished — only an actual
-  // running→done transition should trigger a refetch here (a ticket's
-  // activeJobId clearing), not a running→needs_input one.
-  const liveJobCount = jobs.filter((j) => LIVE_STATUSES.includes(j.status)).length;
+  // needs_input, idle and connection_error are stuck or waiting, not
+  // finished — only an actual live→done transition should trigger a refetch
+  // here (a ticket's activeJobId clearing), not a running→needs_input,
+  // running→idle or running→connection_error one.
+  const liveJobCount = jobs.filter((j) => isLiveStatus(j.status)).length;
   useEffect(() => {
     if (liveJobCount === 0 && jobs.length > 0) fetchTickets();
   }, [liveJobCount, jobs.length, fetchTickets]);
