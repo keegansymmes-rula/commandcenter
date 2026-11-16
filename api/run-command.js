@@ -24,12 +24,25 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { hasBrainContent } from "./brain.js";
-import { SESSION as PEARL_SESSION } from "./lib/pearl-session.js";
+import {
+  CONNECTION_ERROR_TEXT,
+  DIALOG_QUESTION,
+  chatPromptIsEmpty,
+  endsInConnectionError,
+  isAtChatPrompt,
+} from "./lib/pane.js";
+import { NOTICE_TAG, SESSION as PEARL_SESSION } from "./lib/pearl-session.js";
 
 const MAX_LOG_CHARS = 100_000;
 const SESSION_PREFIX = "ccenter-";
 const JOBS_DIR = join(tmpdir(), "ccenter-jobs");
 const POLL_INTERVAL_MS = 2000;
+const TMUX_TIMEOUT_MS = 3000;
+
+// Statuses where the tmux session is still alive and unresolved. needs_input
+// and connection_error are stuck, not done, so they still block a second
+// dispatch and keep the ticket row's jump-to-session button.
+const LIVE_STATUSES = new Set(["running", "needs_input", "connection_error"]);
 
 mkdirSync(JOBS_DIR, { recursive: true });
 
@@ -57,13 +70,25 @@ function truncate(text) {
 // the binary, not guessed) is the more general signal on top of it — any
 // numbered choice sitting there with a selection cursor on it means
 // something is waiting on a keypress, independent of the exact wording.
-const NEEDS_INPUT_QUESTION = /Do you want to [^\n?]*\?/;
 const NEEDS_INPUT_MENU_CURSOR = /^\s*❯\s*\d+\./m;
 
 function needsInput(paneText) {
   const tail = paneText.slice(-2000);
-  if (NEEDS_INPUT_QUESTION.test(tail)) return true;
+  if (DIALOG_QUESTION.test(tail)) return true;
   return NEEDS_INPUT_MENU_CURSOR.test(tail);
+}
+
+// A Claude Code API failure ("API Error: Connection lost mid-response") ends
+// the turn and leaves the agent idle at its prompt: no exit code, no
+// permission dialog, and the agent never reports because it believes it is
+// waiting for the user. It is a status of its own (not a flag on "running")
+// because every consumer already branches on status. needsInput() above looks
+// for a dialog anywhere in the tail, so an old dialog still on screen matches
+// it too; the poll therefore asks this first. It is true only when the error is
+// the newest thing in the pane, which a newer dialog is not. The text matching
+// and "is it still the latest state" rules live in lib/pane.js.
+function connectionError(paneText) {
+  return endsInConnectionError(paneText);
 }
 
 function sessionNameFor(id) {
@@ -84,6 +109,18 @@ function exitFilePath(id) {
 
 function metaFilePath(id) {
   return join(JOBS_DIR, `${id}.meta.json`);
+}
+
+// Present while the supervisor has been told about the job's current
+// connection error (or we gave up trying). On disk rather than on the job so
+// an API restart (`node --watch` restarts on every edit) does not re-announce
+// a session that is still stuck. Ids come from tmux session names, which can
+// hold anything, so an id outside SAFE_ID gets no marker (null) rather than a
+// path that could leave JOBS_DIR.
+const SAFE_ID = /^[A-Za-z0-9-]+$/;
+
+function connectionErrorMarkerPath(id) {
+  return SAFE_ID.test(id) ? join(JOBS_DIR, `${id}.connection-error`) : null;
 }
 
 // The only shell-interpolated parts are paths we generated ourselves
@@ -193,11 +230,108 @@ function finish(job, { exitCode, error }) {
   job.finishedAt = new Date().toISOString();
 }
 
+// Retries stop after ~1 minute of polls: a supervisor that is stuck on a
+// dialog for longer than that is already asking for the human, and the
+// session still shows connection_error in the dashboard and /api/jobs.
+const NOTICE_MAX_ATTEMPTS = 30;
+const TICKET_KEY = /^[A-Z][A-Z0-9]+-\d+$/;
+
+// Fixed text plus the job id (and a ticket key only if it has the Jira key
+// shape). The title and prompt are deliberately left out: they come from
+// Jira and the user, and this string is typed into a supervisor agent's
+// input as if the user had written it. NOTICE_TAG is how she tells it apart.
+function connectionErrorNotice(job) {
+  const ticket = job.ticketKey && TICKET_KEY.test(job.ticketKey) ? ` (${job.ticketKey})` : "";
+  return (
+    `${NOTICE_TAG} Agent session ${job.id}${ticket} hit "${CONNECTION_ERROR_TEXT}" ` +
+    `and is idle at its prompt; its job status is connection_error. Tell the user, and offer to ` +
+    `open its terminal (POST /api/jobs/${job.id}/open-terminal) so they can tell it to continue. ` +
+    `This is a one-time notice for this error, so don't poll for it.`
+  );
+}
+
+// The only server-to-supervisor channel is typing into her tmux pane (the
+// approach pearl-speak.js uses for voice), which is only safe at an empty,
+// framed chat prompt. Anywhere else (a dialog, a half-written draft, no
+// session) this declines and the caller retries on the next poll.
+function sendNoticeToSupervisor(text) {
+  try {
+    const pane = execFileSync("tmux", ["capture-pane", "-t", PEARL_SESSION, "-p"], {
+      encoding: "utf-8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: TMUX_TIMEOUT_MS,
+    });
+    if (!isAtChatPrompt(pane) || !chatPromptIsEmpty(pane)) return false;
+
+    // One tmux invocation (`;` separates commands) so a failure cannot leave
+    // the text typed without the Enter.
+    execFileSync(
+      "tmux",
+      ["send-keys", "-t", PEARL_SESSION, "-l", text, ";", "send-keys", "-t", PEARL_SESSION, "Enter"],
+      { stdio: "ignore", timeout: TMUX_TIMEOUT_MS },
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// One notice per occurrence: once the supervisor has been told (or we gave
+// up) that is recorded on the job and in the marker file, and both are
+// cleared as soon as the job leaves connection_error, so a later, separate
+// error announces itself again. The in-memory flag is what holds if the
+// marker cannot be written (jobs dir gone, disk full); the file only carries
+// the state across an API restart.
+function trackConnectionError(job) {
+  const marker = connectionErrorMarkerPath(job.id);
+
+  if (job.status !== "connection_error") {
+    job.noticeAttempts = 0;
+    job.noticeDone = false;
+    // existsSync first: this runs for every live job on every poll, and
+    // almost always there is nothing to remove.
+    if (marker && existsSync(marker)) {
+      try {
+        unlinkSync(marker);
+      } catch {
+        // Best-effort; worst case the next occurrence is not announced.
+      }
+    }
+    return;
+  }
+
+  if (job.noticeDone || (marker && existsSync(marker))) {
+    job.noticeDone = true;
+    return;
+  }
+
+  job.noticeAttempts = (job.noticeAttempts ?? 0) + 1;
+  const deliverable = SAFE_ID.test(job.id);
+  if (deliverable && sendNoticeToSupervisor(connectionErrorNotice(job))) {
+    job.noticeDone = true;
+    writeMarker(marker, "notified");
+  } else if (!deliverable || job.noticeAttempts >= NOTICE_MAX_ATTEMPTS) {
+    console.warn(`connection_error notice for job ${job.id} not delivered; giving up`);
+    job.noticeDone = true;
+    writeMarker(marker, "gave up");
+  }
+}
+
+function writeMarker(path, content) {
+  if (!path) return;
+  try {
+    writeFileSync(path, `${content} ${new Date().toISOString()}\n`, "utf-8");
+  } catch {
+    // Dedupe across an API restart is lost; within this process the job's
+    // noticeDone flag still holds. Not worth failing the poll over.
+  }
+}
+
 function pollRunningJobs() {
   syncJobsFromTmux();
 
   for (const job of jobs.values()) {
-    if (job.status !== "running" && job.status !== "needs_input") continue;
+    if (!LIVE_STATUSES.has(job.status)) continue;
 
     let pane;
     try {
@@ -224,7 +358,16 @@ function pollRunningJobs() {
 
     // Finishing takes priority over this — a prompt that got answered and
     // then exited shouldn't flicker back to "needs input" on its last poll.
-    job.status = needsInput(pane) ? "needs_input" : "running";
+    // Between the two stuck states, whichever is latest in the pane wins:
+    // connectionError() is true only when nothing (a dialog included) follows
+    // the error, and needsInput() alone cannot tell an old dialog from a live
+    // one, so it must not be asked first.
+    job.status = connectionError(pane)
+      ? "connection_error"
+      : needsInput(pane)
+        ? "needs_input"
+        : "running";
+    trackConnectionError(job);
   }
 }
 
@@ -307,7 +450,9 @@ export function startCommandJob({
 // agent actually wrote to it, not whether one exists.
 export function serializeJob(job, { includeLog = false } = {}) {
   if (!job) return null;
-  const { log, ...rest } = job;
+  // noticeAttempts / noticeDone are poller bookkeeping, not part of the job's
+  // API shape.
+  const { log, noticeAttempts, noticeDone, ...rest } = job;
   const withBrain = { ...rest, hasBrain: hasBrainContent(job.id) };
   return includeLog ? { ...withBrain, log } : withBrain;
 }
@@ -325,10 +470,10 @@ export function listJobs() {
 // against a ticket that already has one in flight.
 export function findRunningJobForTicket(ticketKey) {
   for (const job of jobs.values()) {
-    // needs_input is still a live session (stuck, not done) — it should
-    // still block a second dispatch and still show the ticket row's
-    // jump-to-session button instead of reverting to "spawn".
-    if (job.ticketKey === ticketKey && (job.status === "running" || job.status === "needs_input")) {
+    // needs_input / connection_error are still live sessions (stuck, not
+    // done) — they should still block a second dispatch and still show the
+    // ticket row's jump-to-session button instead of reverting to "spawn".
+    if (job.ticketKey === ticketKey && LIVE_STATUSES.has(job.status)) {
       return job;
     }
   }
@@ -474,7 +619,12 @@ export function closeJob(id) {
   }
 
   jobs.delete(id);
-  for (const path of [promptFilePath(id), exitFilePath(id), metaFilePath(id)]) {
+  for (const path of [
+    promptFilePath(id),
+    exitFilePath(id),
+    metaFilePath(id),
+    connectionErrorMarkerPath(id),
+  ].filter(Boolean)) {
     try {
       unlinkSync(path);
     } catch {
@@ -493,5 +643,11 @@ export const __test__ = {
   idFromSessionName,
   innerCommand,
   needsInput,
+  connectionError,
+  connectionErrorMarkerPath,
+  connectionErrorNotice,
+  pollRunningJobs,
   syncJobsFromTmux,
+  NOTICE_MAX_ATTEMPTS,
+  LIVE_STATUSES,
 };
