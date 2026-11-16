@@ -12,7 +12,7 @@ import {
   getCurrentUser,
   transitionForEvent,
 } from "./lib/jira.js";
-import { isPrUrl, searchMyPrs, viewPr } from "./lib/pr.js";
+import { isPrUrl, listReviewRequests, searchMyPrs, viewPr } from "./lib/pr.js";
 import { adfToPlainText } from "./lib/adf.js";
 import {
   closeJob,
@@ -248,6 +248,17 @@ app.get("/api/prs", async () => {
     }));
 
     return { ok: true, prs, announceEnabled: isAnnounceConfigured() };
+  } catch (err) {
+    return { ok: false, error: err.message };
+  }
+});
+
+// Open PRs awaiting a review from you personally (not via a team). A gh
+// failure comes back ok:false rather than an empty list, so the tab shows
+// the error instead of a false "nothing to review".
+app.get("/api/review-requests", async () => {
+  try {
+    return { ok: true, prs: listReviewRequests() };
   } catch (err) {
     return { ok: false, error: err.message };
   }

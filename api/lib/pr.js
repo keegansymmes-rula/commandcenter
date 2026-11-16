@@ -1,4 +1,4 @@
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 
 function run(cmd, cwd) {
@@ -89,6 +89,63 @@ export function searchMyPrs({ role = "author", state = "open", limit = 30 } = {}
   } catch {
     return [];
   }
+}
+
+const GH_TIMEOUT_MS = 20_000;
+
+// Unlike run(), a failure here must reach the caller: "gh isn't logged in"
+// rendered as an empty review queue would read as "nothing to review".
+function runStrict(args) {
+  try {
+    return execFileSync("gh", args, {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: GH_TIMEOUT_MS,
+    }).trim();
+  } catch (err) {
+    const detail = String(err.stderr || err.message || "").trim();
+    throw new Error(`gh search failed: ${detail || "unknown error"}`);
+  }
+}
+
+// Open PRs where GitHub is asking *you* for review, across every repo.
+// `user-review-requested:@me` matches only a request addressed to your own
+// account. `review-requested:@me` (and `gh search prs --review-requested=@me`,
+// which sends it) also matches a request made to a team you belong to — a
+// whole-team ping nobody personally owes a review on. GitHub silently ignores
+// a qualifier it doesn't know, so a typo here would return unrelated PRs
+// rather than fail; tests/pr.test.js pins the exact qualifier.
+export function searchReviewRequestedPrs({ state = "open", limit = 50 } = {}) {
+  const result = runStrict([
+    "search",
+    "prs",
+    "user-review-requested:@me",
+    `--state=${state}`,
+    "--json",
+    "repository,number,title,url,isDraft,updatedAt,author",
+    `--limit=${limit}`,
+  ]);
+  return result ? JSON.parse(result) : [];
+}
+
+// Same card fields as /api/prs, plus the author (the roles chips don't apply:
+// every row here is a review request). Most recently updated first.
+export function shapeReviewRequests(rawPrs) {
+  return [...rawPrs]
+    .map((pr) => ({
+      repo: pr.repository?.nameWithOwner || null,
+      number: pr.number,
+      title: pr.title,
+      url: pr.url,
+      isDraft: Boolean(pr.isDraft),
+      updatedAt: pr.updatedAt,
+      author: pr.author?.login || null,
+    }))
+    .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+}
+
+export function listReviewRequests() {
+  return shapeReviewRequests(searchReviewRequestedPrs());
 }
 
 const PR_URL = /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/\d+$/;

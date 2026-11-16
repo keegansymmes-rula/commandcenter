@@ -244,10 +244,11 @@ body {
 .focus-column--tickets { border-left-color: var(--blue); }
 .focus-column--todos { border-left-color: var(--amber); }
 .focus-column--prs { border-left-color: var(--green); }
+.focus-column--reviews { border-left-color: var(--red); }
 .focus-column--sessions { border-left-color: var(--accent); }
 .focus-column--pearl-config { border-left-color: var(--accent); }
 
-/* Left grid cell: a tab bar above a single visible panel. All three tab
+/* Left grid cell: a tab bar above a single visible panel. All tab
    panels stay mounted (display:none when inactive) so switching tabs is
    instant and doesn't restart that tab's own polling. */
 .focus-tabbed-pane {
@@ -294,6 +295,7 @@ body {
 .focus-tab--tickets.focus-tab--active { box-shadow: inset 0 -2px 0 var(--blue); }
 .focus-tab--todos.focus-tab--active { box-shadow: inset 0 -2px 0 var(--amber); }
 .focus-tab--prs.focus-tab--active { box-shadow: inset 0 -2px 0 var(--green); }
+.focus-tab--reviews.focus-tab--active { box-shadow: inset 0 -2px 0 var(--red); }
 .focus-tab--pearl.focus-tab--active { box-shadow: inset 0 -2px 0 var(--accent); }
 
 .focus-tab-panels {

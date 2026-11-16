@@ -1,5 +1,5 @@
 ---
-description: List the user's open pull requests and post one to their Slack channel through Command Center. Use when the user asks about their PRs, what needs review, or to announce or post a specific PR.
+description: List the user's open pull requests and post one to their Slack channel through Command Center. Use when the user asks about their PRs, what needs their review, or to announce or post a specific PR.
 ---
 
 # Command Center: pull requests
@@ -18,6 +18,24 @@ authored or is assigned to, across all repos.
 | `updatedAt` | Last activity |
 | `roles` | `author`, `assignee`, or both |
 | `isAnnounced` | Already posted to Slack |
+
+## Review requests
+
+`GET /api/review-requests` returns `{ok, prs}`: every open PR, across all
+repos, where GitHub asks the user **personally** for review. A request made
+only to a team they belong to is not included. Use it for "what needs my
+review?"; `GET /api/prs` is only the user's own PRs.
+
+| Field | Meaning |
+|---|---|
+| `repo`, `number`, `title`, `url` | The PR |
+| `author` | Who opened it (`null` if the account is gone) |
+| `isDraft` | Drafts aren't ready for review |
+| `updatedAt` | Last activity (list is newest first) |
+
+`{ok: false, error}` means `gh` failed (not logged in, timeout). That is not
+an empty queue, so tell the user instead of saying nothing needs review.
+Never announce one of these to Slack: they are other people's PRs.
 
 ## Announce one
 
