@@ -11,3 +11,8 @@ export const PEARL_NAME = process.env.PEARL_NAME?.trim() || "Pearl";
 export const SESSION = `ccenter-${
   PEARL_NAME.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "pearl"
 }`;
+
+// Marks text the server types into the supervisor's prompt, which otherwise
+// looks exactly like something the user typed. The briefing teaches her to
+// treat a line starting with this as a status notice, never as a request.
+export const NOTICE_TAG = "[cc-notice]";
