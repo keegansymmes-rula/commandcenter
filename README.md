@@ -81,6 +81,17 @@ Write actions (dispatching an agent, running the supervisor agent, ticket
 cleanup/promote) always run — there's no env gate or UI toggle to disable
 them.
 
+## Review requests
+
+The dashboard's tabs are Tickets, Todos, Pull Requests, Review Requests, and
+the supervisor agent (labelled with its `PEARL_NAME`). Review Requests lists
+open PRs where GitHub asks you personally for review, from
+`GET /api/review-requests`, which runs
+`gh search prs "user-review-requested:@me" --state=open`. That qualifier
+leaves out requests made only to a team you belong to; `review-requested:@me`
+(and `gh search prs --review-requested=@me`) includes them. A `gh` failure
+shows as an error in the tab, not an empty list.
+
 ## Dispatch
 
 `POST /api/dispatch` with `{ prompt, context, mode, brain }` starts an
@@ -146,7 +157,7 @@ lives in one skill per capability, in `commands/`, loaded only when needed:
 | `/cc-dispatch` | Supervisor agent | Starting, tracking, and closing agent sessions |
 | `/cc-tickets` | Supervisor agent | Reading the user's tickets; changing them through `api/lib/jira.js` |
 | `/cc-todos` | Supervisor agent | Listing, adding, and completing todos |
-| `/cc-prs` | Supervisor agent | Listing open PRs; posting one to Slack |
+| `/cc-prs` | Supervisor agent | Listing open PRs and review requests; posting one to Slack |
 | `/cc-memory` | Supervisor agent | Searching and saving its memory |
 | `/cc-brain-view` | Dispatched agents | Using the Brain View canvas |
 | `/cc-report` | Dispatched agents | Reporting back to the supervisor agent when done |
