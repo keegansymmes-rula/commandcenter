@@ -31,7 +31,7 @@ review?"; `GET /api/prs` is only the user's own PRs.
 | `repo`, `number`, `title`, `url` | The PR |
 | `author` | Who opened it (`null` if the account is gone) |
 | `isDraft` | Drafts aren't ready for review |
-| `updatedAt` | Last activity (list is newest first) |
+| `updatedAt` | Last activity (GitHub returns the list newest first) |
 
 `{ok: false, error}` means `gh` failed (not logged in, timeout). That is not
 an empty queue, so tell the user instead of saying nothing needs review.

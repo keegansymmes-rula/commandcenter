@@ -258,7 +258,7 @@ app.get("/api/prs", async () => {
 // the error instead of a false "nothing to review".
 app.get("/api/review-requests", async () => {
   try {
-    return { ok: true, prs: listReviewRequests() };
+    return { ok: true, prs: await listReviewRequests() };
   } catch (err) {
     return { ok: false, error: err.message };
   }

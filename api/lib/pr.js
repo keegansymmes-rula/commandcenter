@@ -1,4 +1,4 @@
-import { execFileSync, execSync } from "node:child_process";
+import { execFile, execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 
 function run(cmd, cwd) {
@@ -95,17 +95,19 @@ const GH_TIMEOUT_MS = 20_000;
 
 // Unlike run(), a failure here must reach the caller: "gh isn't logged in"
 // rendered as an empty review queue would read as "nothing to review".
+// Async, because the dashboard polls this every minute and a slow search must
+// not stall the API's other routes (session updates, dispatch) for its duration.
 function runStrict(args) {
-  try {
-    return execFileSync("gh", args, {
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: GH_TIMEOUT_MS,
-    }).trim();
-  } catch (err) {
-    const detail = String(err.stderr || err.message || "").trim();
-    throw new Error(`gh search failed: ${detail || "unknown error"}`);
-  }
+  return new Promise((resolve, reject) => {
+    execFile("gh", args, { encoding: "utf-8", timeout: GH_TIMEOUT_MS }, (err, stdout, stderr) => {
+      if (err) {
+        const detail = String(stderr || err.message || "").trim();
+        reject(new Error(`gh search failed: ${detail || "unknown error"}`));
+        return;
+      }
+      resolve(String(stdout).trim());
+    });
+  });
 }
 
 // Open PRs where GitHub is asking *you* for review, across every repo.
@@ -115,12 +117,18 @@ function runStrict(args) {
 // whole-team ping nobody personally owes a review on. GitHub silently ignores
 // a qualifier it doesn't know, so a typo here would return unrelated PRs
 // rather than fail; tests/pr.test.js pins the exact qualifier.
-export function searchReviewRequestedPrs({ state = "open", limit = 50 } = {}) {
-  const result = runStrict([
+//
+// Sorted by GitHub, not afterwards: the default is best-match, so with more
+// than `limit` requests the cut would drop the newest ones and re-sorting the
+// survivors couldn't bring them back.
+export async function searchReviewRequestedPrs({ state = "open", limit = 50 } = {}) {
+  const result = await runStrict([
     "search",
     "prs",
     "user-review-requested:@me",
     `--state=${state}`,
+    "--sort=updated",
+    "--order=desc",
     "--json",
     "repository,number,title,url,isDraft,updatedAt,author",
     `--limit=${limit}`,
@@ -129,23 +137,21 @@ export function searchReviewRequestedPrs({ state = "open", limit = 50 } = {}) {
 }
 
 // Same card fields as /api/prs, plus the author (the roles chips don't apply:
-// every row here is a review request). Most recently updated first.
+// every row here is a review request). Order is whatever GitHub returned.
 export function shapeReviewRequests(rawPrs) {
-  return [...rawPrs]
-    .map((pr) => ({
-      repo: pr.repository?.nameWithOwner || null,
-      number: pr.number,
-      title: pr.title,
-      url: pr.url,
-      isDraft: Boolean(pr.isDraft),
-      updatedAt: pr.updatedAt,
-      author: pr.author?.login || null,
-    }))
-    .sort((a, b) => String(b.updatedAt).localeCompare(String(a.updatedAt)));
+  return rawPrs.map((pr) => ({
+    repo: pr.repository?.nameWithOwner || null,
+    number: pr.number,
+    title: pr.title,
+    url: pr.url,
+    isDraft: Boolean(pr.isDraft),
+    updatedAt: pr.updatedAt,
+    author: pr.author?.login || null,
+  }));
 }
 
-export function listReviewRequests() {
-  return shapeReviewRequests(searchReviewRequestedPrs());
+export async function listReviewRequests() {
+  return shapeReviewRequests(await searchReviewRequestedPrs());
 }
 
 const PR_URL = /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/\d+$/;
