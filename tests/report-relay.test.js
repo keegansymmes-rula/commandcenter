@@ -208,6 +208,9 @@ describe("classifyAwaiting: is a stopped session waiting on the user", () => {
     ["a list with no question before it", "Changes:\n- Added the field\n- Updated the tests"],
     ["a `!` mentioned with no ask", "Added a `!` prefix check in the parser."],
     ["a `!important` in prose", "Fixed the style: the rule no longer needs !important, and tests run green."],
+    ["a completed report that mentions `!important`", "Removed `!important` from the stylesheet; tests run green."],
+    ["a completed report that mentions a `!` command", "Updated the docs to show `! aws sso login`; users type it themselves."],
+    ["a completed report that mentions a compact `!` command", "The helper now accepts `!aws sso login`, and the tests run clean."],
     ["no text at all", ""],
   ])("does not infer waiting from %s", (_name, text) => {
     expect(ask(text)).toBeNull();

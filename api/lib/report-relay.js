@@ -96,10 +96,15 @@ const NOTE_MAX_CHARS = 160;
 const INFERENCE_TAIL_CHARS = 600;
 const LIST_ITEM = /^\s*(?:\d{1,2}[.)]|[A-Za-z][.)]|[-*•])\s+\S/;
 const OPTION_CUE = /\b(which|choose|pick|prefer|select|let me know|reply|decide|option)\b/i;
-// Bash mode takes `! cmd` and `!cmd`. The compact form is only accepted right
-// after a backtick or at a line start, so prose like "!important" doesn't match.
-const BANG_COMMAND = /(?:^|[`\s])!\s+[a-z]|(?:^|`)!\s*[a-z]/m;
-const BANG_CUE = /\b(run|type|execute|enter|log ?in|authenticate|paste)\b/i;
+// Asking the user to run a `!` (bash mode) command takes `! cmd` or `!cmd`. The
+// verb has to lead into the command, so a report that merely mentions `!` and,
+// elsewhere, a word like "run" ("removed `!important`; tests run green") is not
+// a request. Two shapes: the verb a few words before the command on one line,
+// or a lead-in line ending in a colon above a (fenced) command line.
+const BANG_REQUESTS = [
+  /\b(?:run|type|enter|execute|paste)\b[^\n.`]{0,30}(?:`\s*!\s*[a-z]|\s!\s+[a-z])/i,
+  /\b(?:run|type|enter|execute|paste|log ?in|authenticate)\b[^\n]*:[ \t]*\n+(?:[ \t]*```[^\n]*\n)?[ \t]*!\s*[a-z]/i,
+];
 
 function lastLines(text) {
   return text
@@ -130,7 +135,7 @@ function looksLikeAskingTheUser(text) {
   }
 
   const tail = text.slice(-INFERENCE_TAIL_CHARS);
-  return BANG_COMMAND.test(tail) && BANG_CUE.test(tail);
+  return BANG_REQUESTS.some((re) => re.test(tail));
 }
 
 // Is a session that just stopped waiting on the user? The marker (last non-empty
