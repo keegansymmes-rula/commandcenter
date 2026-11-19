@@ -8,7 +8,7 @@
 
 import { useEffect, useState } from "react";
 import { StatusIcon } from "./StatusIcon.jsx";
-import { isLiveStatus } from "./jobStatus.js";
+import { isLiveStatus, needsInputTitle } from "./jobStatus.js";
 
 function useOpenInIterm(jobId) {
   const [state, setState] = useState("idle"); // idle | opening | error
@@ -89,7 +89,9 @@ function SessionCard({ job, onClose }) {
           </span>
         )}
         {job.status === "needs_input" && (
-          <span className="session-needs-input">needs input</span>
+          <span className="session-needs-input" title={needsInputTitle(job)}>
+            needs input
+          </span>
         )}
         {job.status === "idle" && (
           <span className="session-idle" title="The agent stopped and has nothing for you to do right now — close it when you're done">

@@ -8,3 +8,19 @@ export const LIVE_STATUSES = ["running", "needs_input", "idle", "connection_erro
 export function isLiveStatus(status) {
   return LIVE_STATUSES.includes(status);
 }
+
+// What a needs_input badge says on hover. The reason comes from the API
+// (needsInputReason); a job from an older API has none, so it gets the generic
+// wording. The note is the agent's own words and is only ever rendered as text.
+export function needsInputTitle(job) {
+  if (job.needsInputReason === "question") {
+    const note = typeof job.needsInputNote === "string" ? job.needsInputNote.trim() : "";
+    return note
+      ? `Waiting for your reply: ${note}`
+      : "The agent stopped and is waiting for your reply — open its terminal and answer";
+  }
+  if (job.needsInputReason === "permission") {
+    return "A permission prompt or menu is waiting for your answer — open its terminal";
+  }
+  return "Waiting on you — open its terminal";
+}

@@ -36,6 +36,7 @@ import {
   findTranscript,
   inferAwaiting,
   inputBoxIsEmpty,
+  QUIET_MS,
   readTranscriptTail,
   relayIfUndelivered,
   TMUX_TIMEOUT_MS,
@@ -544,8 +545,116 @@ function writeMarker(path, content) {
   }
 }
 
+// A session that stopped waiting on the user's reply (needs_input, reason
+// "question") is announced to the supervisor like a connection error is, with
+// two differences. Many sessions can stop at once (a batch finishing), and each
+// notice is a turn the supervisor has to take, so the sessions that are due are
+// folded into one line that names at most a few of them. And the line is held
+// back briefly and rate-limited, so a Stop-hook continuation that flips the
+// session straight back to running is never announced, and sessions trickling
+// in cannot become a stream of lines.
+const QUESTION_NOTICE_DELAY_MS = QUIET_MS;
+const QUESTION_NOTICE_MIN_GAP_MS = 60_000;
+const QUESTION_NOTICE_MAX_IDS = 5;
+let lastQuestionNoticeAt = 0;
+
+function questionNoticeMarkerPath(id) {
+  return SAFE_ID.test(id) ? join(JOBS_DIR, `${id}.needs-input-notice`) : null;
+}
+
+function isWaitingOnReply(job) {
+  return job.status === "needs_input" && job.needsInputReason === "question";
+}
+
+// Fixed text plus job ids and Jira-shaped ticket keys. The agent's note and the
+// job title are left out for the same reason as in connectionErrorNotice: this
+// line is typed into the supervisor as if the user had written it.
+function questionNotice(batch) {
+  const shown = batch.slice(0, QUESTION_NOTICE_MAX_IDS).map((job) => {
+    const ticket = job.ticketKey && TICKET_KEY.test(job.ticketKey) ? ` (${job.ticketKey})` : "";
+    return `${job.id}${ticket}`;
+  });
+  const more =
+    batch.length > shown.length ? ` and ${batch.length - shown.length} more (list them with GET /api/jobs)` : "";
+  const one = batch.length === 1;
+  return (
+    `${NOTICE_TAG} ${batch.length} agent ${one ? "session has" : "sessions have"} stopped and ` +
+    `${one ? "is" : "are"} waiting for the user's reply (job status needs_input, needsInputReason question): ` +
+    `${shown.join(", ")}${more}. Tell the user, and offer to open ${one ? "its terminal" : "their terminals"} ` +
+    `(POST /api/jobs/<id>/open-terminal) so they can answer. This is a one-time notice, so don't poll for it.`
+  );
+}
+
+// Per job, every poll: when it entered the state, and whether it was already
+// announced (kept on disk too, so an API restart does not announce it again).
+// Both reset as soon as it leaves, so a later, separate question announces
+// itself.
+function trackQuestion(job, now) {
+  const marker = questionNoticeMarkerPath(job.id);
+
+  if (!isWaitingOnReply(job)) {
+    job.questionSince = null;
+    job.questionNoticeDone = false;
+    job.questionNoticeAttempts = 0;
+    if (marker && existsSync(marker)) {
+      try {
+        unlinkSync(marker);
+      } catch {
+        // Best-effort; worst case the next question is not announced.
+      }
+    }
+    return;
+  }
+
+  job.questionSince ??= now;
+  if (!job.questionNoticeDone && marker && existsSync(marker)) job.questionNoticeDone = true;
+}
+
+function announceQuestions(now) {
+  if (now - lastQuestionNoticeAt < QUESTION_NOTICE_MIN_GAP_MS) return;
+
+  const due = [...jobs.values()]
+    .filter(
+      (job) =>
+        isLive(job.status) &&
+        isWaitingOnReply(job) &&
+        !job.questionNoticeDone &&
+        job.questionSince != null &&
+        now - job.questionSince >= QUESTION_NOTICE_DELAY_MS,
+    )
+    .sort((a, b) => a.questionSince - b.questionSince);
+
+  // An id outside SAFE_ID can't be named in a typed line or given a marker.
+  for (const job of due) {
+    if (!SAFE_ID.test(job.id)) job.questionNoticeDone = true;
+  }
+  const batch = due.filter((job) => !job.questionNoticeDone);
+  if (batch.length === 0) return;
+
+  if (sendNoticeToSupervisor(questionNotice(batch))) {
+    lastQuestionNoticeAt = now;
+    for (const job of batch) {
+      job.questionNoticeDone = true;
+      writeMarker(questionNoticeMarkerPath(job.id), "notified");
+    }
+    return;
+  }
+
+  // The supervisor is busy or mid-draft; retry on the next poll, for about a
+  // minute, then give up on the job (the dashboard still shows it).
+  for (const job of batch) {
+    job.questionNoticeAttempts = (job.questionNoticeAttempts ?? 0) + 1;
+    if (job.questionNoticeAttempts >= NOTICE_MAX_ATTEMPTS) {
+      console.warn(`needs_input notice for job ${job.id} not delivered; giving up`);
+      job.questionNoticeDone = true;
+      writeMarker(questionNoticeMarkerPath(job.id), "gave up");
+    }
+  }
+}
+
 function pollRunningJobs() {
   syncJobsFromTmux();
+  const now = Date.now();
 
   for (const job of jobs.values()) {
     if (!isLive(job.status)) continue;
@@ -590,14 +699,17 @@ function pollRunningJobs() {
     job.needsInputReason = state.reason;
     job.needsInputNote = state.note;
     trackConnectionError(job);
+    trackQuestion(job, now);
     // A "running" or "idle" job is relayed: idle is exactly the session that
     // stopped its turn, which is the one that may have ended without reporting
     // (relayIfUndelivered checks the transcript, not this status). Skipping
-    // idle would leave the relay firing only at close. connection_error
-    // already has its own supervisor notice, and needs_input is waiting on a
-    // human.
+    // idle would leave the relay firing only at close. connection_error and a
+    // needs_input question already have their own supervisor notices, and
+    // needs_input is waiting on a human.
     if (job.status === "running" || job.status === "idle") tryRelay(job);
   }
+
+  announceQuestions(now);
 }
 
 syncJobsFromTmux();
@@ -691,9 +803,16 @@ export function startCommandJob({
 // agent actually wrote to it, not whether one exists.
 export function serializeJob(job, { includeLog = false } = {}) {
   if (!job) return null;
-  // noticeAttempts / noticeDone are poller bookkeeping, not part of the job's
-  // API shape.
-  const { log, noticeAttempts, noticeDone, ...rest } = job;
+  // The notice fields are poller bookkeeping, not part of the job's API shape.
+  const {
+    log,
+    noticeAttempts,
+    noticeDone,
+    questionSince,
+    questionNoticeDone,
+    questionNoticeAttempts,
+    ...rest
+  } = job;
   const withBrain = { ...rest, hasBrain: hasBrainContent(job.id) };
   return includeLog ? { ...withBrain, log } : withBrain;
 }
@@ -875,6 +994,7 @@ export function closeJob(id) {
     metaFilePath(id),
     stateFilePath(id),
     connectionErrorMarkerPath(id),
+    questionNoticeMarkerPath(id),
   ].filter(Boolean)) {
     try {
       unlinkSync(path);
@@ -903,6 +1023,11 @@ export const __test__ = {
   connectionError,
   connectionErrorMarkerPath,
   connectionErrorNotice,
+  questionNotice,
+  questionNoticeMarkerPath,
+  QUESTION_NOTICE_DELAY_MS,
+  QUESTION_NOTICE_MIN_GAP_MS,
+  QUESTION_NOTICE_MAX_IDS,
   pollRunningJobs,
   syncJobsFromTmux,
   supervisorState,
