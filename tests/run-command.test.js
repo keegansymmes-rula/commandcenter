@@ -284,11 +284,16 @@ describe("resolveLiveState: a stopped session waiting on a reply", () => {
       status: "needs_input",
       reason: "question",
       note: "Pick option 1 or 2.",
+      turn: null,
     });
   });
 
+  it("carries the id of the message the question came from", () => {
+    expect(state({ awaiting: { ...question, turn: "msg_1" } }).turn).toBe("msg_1");
+  });
+
   it("stays idle, with no reason, when there is nothing for the user to do", () => {
-    expect(state({ awaiting: null })).toEqual({ status: "idle", reason: null, note: null });
+    expect(state({ awaiting: null })).toEqual({ status: "idle", reason: null, note: null, turn: null });
   });
 
   it("defaults to idle for a caller that knows nothing about the transcript", () => {
@@ -1058,6 +1063,7 @@ describe("supervisor notice for a session waiting on a reply", () => {
   let supervisorPane;
   let sent;
   let waiting;
+  let turns;
   let panes;
   let at;
 
@@ -1076,6 +1082,7 @@ describe("supervisor notice for a session waiting on a reply", () => {
     supervisorPane = box();
     sent = [];
     waiting = new Set();
+    turns = new Map();
     panes = new Map();
     vi.useFakeTimers();
     vi.setSystemTime(T0);
@@ -1097,11 +1104,20 @@ describe("supervisor notice for a session waiting on a reply", () => {
     }));
     vi.doMock("../api/lib/report-relay.js", async (importOriginal) => ({
       ...(await importOriginal()),
-      inferAwaiting: (job) => (waiting.has(job.id) ? { source: "marker", note: "the secret note" } : null),
+      inferAwaiting: (job) =>
+        waiting.has(job.id)
+          ? { source: "marker", note: "the secret note", turn: turns.get(job.id) ?? null }
+          : null,
       relayIfUndelivered: () => "stubbed",
     }));
     vi.resetModules();
-    return (await import("../api/run-command.js")).__test__;
+    const t = (await import("../api/run-command.js")).__test__;
+    // Shared state the notice keeps in the jobs dir, which outlives a test.
+    for (const path of [t.questionNoticeLastPath, t.questionNoticeLockPath]) {
+      rmSync(path, { force: true });
+      files.push(path);
+    }
+    return t;
   }
 
   function addJob(t, overrides = {}) {
@@ -1328,6 +1344,115 @@ describe("supervisor notice for a session waiting on a reply", () => {
     expect(sent).toHaveLength(0);
   });
 
+  it("announces a new question even though no poll saw the session leave the state", async () => {
+    const t = await load();
+    const job = addJob(t);
+    turns.set(job.id, "msg_1");
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+
+    // The user answered and the agent asked again inside one poll interval, so
+    // the status never left needs_input. It is held down again like a new one.
+    turns.set(job.id, "msg_2");
+    at(t.QUESTION_NOTICE_DELAY_MS + 1000);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+
+    at(t.QUESTION_NOTICE_DELAY_MS + 1000 + t.QUESTION_NOTICE_MIN_GAP_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(2);
+  });
+
+  it("announces a question whose marker on disk is for an earlier question, as after an API restart", async () => {
+    const t = await load();
+    const job = addJob(t);
+    turns.set(job.id, "msg_2");
+    writeFileSync(t.questionNoticeMarkerPath(job.id), "notified turn=msg_1 2026-11-19T00:00:00.000Z\n");
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+  });
+
+  it("does not announce a question whose marker on disk is for the same question", async () => {
+    const t = await load();
+    const job = addJob(t);
+    turns.set(job.id, "msg_1");
+    writeFileSync(t.questionNoticeMarkerPath(job.id), "notified turn=msg_1 2026-11-19T00:00:00.000Z\n");
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(0);
+  });
+
+  it("leaves the notice to another process that holds the lock, and takes over a stale lock", async () => {
+    const t = await load();
+    addJob(t);
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    writeFileSync(t.questionNoticeLockPath, String(T0 + t.QUESTION_NOTICE_DELAY_MS));
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(0);
+    // Holding the lock must not use up the job's delivery attempts.
+    expect([...t.jobs.values()].every((j) => !j.questionNoticeAttempts)).toBe(true);
+
+    // The holder died: its lock is older than any delivery could take.
+    at(t.QUESTION_NOTICE_DELAY_MS + t.QUESTION_LOCK_STALE_MS + 1000);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+  });
+
+  it("releases the lock once it has delivered, or failed to", async () => {
+    const t = await load();
+    addJob(t);
+    supervisorPane = box("half a sentence");
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(existsSync(t.questionNoticeLockPath)).toBe(false);
+
+    supervisorPane = box();
+    at(t.QUESTION_NOTICE_DELAY_MS + 2000);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+    expect(existsSync(t.questionNoticeLockPath)).toBe(false);
+  });
+
+  it("records when it sent, where another process can read it", async () => {
+    const t = await load();
+    addJob(t);
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(readFileSync(t.questionNoticeLastPath, "utf-8")).toBe(String(T0 + t.QUESTION_NOTICE_DELAY_MS));
+  });
+
+  it("honours a notice another process sent a moment ago", async () => {
+    const t = await load();
+    addJob(t);
+    writeFileSync(t.questionNoticeLastPath, String(T0 + t.QUESTION_NOTICE_DELAY_MS - 10_000));
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(0);
+
+    at(t.QUESTION_NOTICE_DELAY_MS - 10_000 + t.QUESTION_NOTICE_MIN_GAP_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+  });
+
+  it("is not silenced by a last-notice time in the future", async () => {
+    const t = await load();
+    addJob(t);
+    writeFileSync(t.questionNoticeLastPath, String(T0 + 10 * 24 * 60 * 60 * 1000));
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+  });
+
   it("words a single session in the singular", async () => {
     const t = await load();
     const line = t.questionNotice([{ id: "abc-1", ticketKey: null }]);
@@ -1342,10 +1467,14 @@ describe("supervisor notice for a session waiting on a reply", () => {
       id: "abc",
       status: "needs_input",
       questionSince: 1,
+      questionTurn: "msg_1",
+      needsInputTurn: "msg_1",
       questionNoticeDone: true,
       questionNoticeAttempts: 2,
       log: "",
     });
+    expect(out).not.toHaveProperty("questionTurn");
+    expect(out).not.toHaveProperty("needsInputTurn");
     expect(out).not.toHaveProperty("questionSince");
     expect(out).not.toHaveProperty("questionNoticeDone");
     expect(out).not.toHaveProperty("questionNoticeAttempts");

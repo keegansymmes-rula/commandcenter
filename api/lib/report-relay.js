@@ -219,9 +219,13 @@ export function analyzeTranscript(records, supervisorName) {
     lastText = texts.join("\n").trim() || null;
   }
 
-  const awaiting = idle
+  // `turn` is the id of the assistant message the question came from, so a
+  // later question from the same session can be told apart from an earlier one
+  // even when no poll saw the session leave the state in between.
+  const found = idle
     ? classifyAwaiting({ text: lastText, reportedThisTurn: lastDeliveredSeq > lastPromptSeq })
     : null;
+  const awaiting = found ? { ...found, turn: last.message?.id ?? null } : null;
 
   return { idle, delivered, lastText, awaiting };
 }
