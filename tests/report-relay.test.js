@@ -196,6 +196,8 @@ describe("classifyAwaiting: is a stopped session waiting on the user", () => {
     ["options introduced by a colon and a cue", "Choose one of these:\n- Keep the field\n- Drop the field"],
     ["a `!` command to run", "AWS SSO has expired. Run `! aws sso login --profile sso` and tell me when it is done."],
     ["a `!` command in a code block", "Please log in:\n\n```\n! aws sso login --profile sso\n```"],
+    ["a compact `!` command", "Please run `!aws sso login` and tell me when done."],
+    ["a compact `!` command at a line start", "Please log in:\n\n```\n!aws sso login --profile sso\n```"],
   ])("infers waiting from %s", (_name, text) => {
     expect(ask(text)).toEqual({ source: "inferred", note: null });
   });
@@ -205,6 +207,7 @@ describe("classifyAwaiting: is a stopped session waiting on the user", () => {
     ["a question that is not at the end", "Why did it fail? A missing env var. Fixed it, tests pass."],
     ["a list with no question before it", "Changes:\n- Added the field\n- Updated the tests"],
     ["a `!` mentioned with no ask", "Added a `!` prefix check in the parser."],
+    ["a `!important` in prose", "Fixed the style: the rule no longer needs !important, and tests run green."],
     ["no text at all", ""],
   ])("does not infer waiting from %s", (_name, text) => {
     expect(ask(text)).toBeNull();

@@ -96,7 +96,9 @@ const NOTE_MAX_CHARS = 160;
 const INFERENCE_TAIL_CHARS = 600;
 const LIST_ITEM = /^\s*(?:\d{1,2}[.)]|[A-Za-z][.)]|[-*•])\s+\S/;
 const OPTION_CUE = /\b(which|choose|pick|prefer|select|let me know|reply|decide|option)\b/i;
-const BANG_COMMAND = /(?:^|[`\s])!\s+[a-z][\w./~-]*(?:[ \t][^\n`]*)?/m;
+// Bash mode takes `! cmd` and `!cmd`. The compact form is only accepted right
+// after a backtick or at a line start, so prose like "!important" doesn't match.
+const BANG_COMMAND = /(?:^|[`\s])!\s+[a-z]|(?:^|`)!\s*[a-z]/m;
 const BANG_CUE = /\b(run|type|execute|enter|log ?in|authenticate|paste)\b/i;
 
 function lastLines(text) {
