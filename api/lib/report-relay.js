@@ -76,13 +76,95 @@ function isSuccessfulResult(block) {
   return !/"success"\s*:\s*false/.test(resultText(block));
 }
 
-// Reads one session's records and answers the two questions relaying needs:
-// is the session idle (its last turn ended and nothing is pending), and did a
-// SendMessage to the supervisor succeed.
+// A user record that is something the user (or the dispatcher) said, as opposed
+// to a tool result or a harness-injected meta message. Delimits "this turn".
+function isUserPrompt(record) {
+  if (record.type !== "user" || record.isMeta) return false;
+  const content = record.message?.content;
+  if (typeof content === "string") return content.trim() !== "";
+  return contentBlocks(record).some((b) => b.type === "text");
+}
+
+// The dispatch prompt asks a session whose turn ends waiting on the user to
+// finish with this line. It lives here, next to the parser that reads it, so
+// the instruction and the detector can't drift apart.
+export const NEEDS_INPUT_MARKER = "[needs-input]";
+export const NEEDS_INPUT_INSTRUCTION =
+  `If your turn ends because you are waiting on the user (a question, a choice between options, or a command for them to run such as a \`!\` login), make the last line of your final message \`${NEEDS_INPUT_MARKER} \` followed by one short sentence saying what you need. Don't add it when you are only waiting on another session, or when there is nothing for the user to do.`;
+
+const NOTE_MAX_CHARS = 160;
+const INFERENCE_TAIL_CHARS = 600;
+const LIST_ITEM = /^\s*(?:\d{1,2}[.)]|[A-Za-z][.)]|[-*•])\s+\S/;
+const OPTION_CUE = /\b(which|choose|pick|prefer|select|let me know|reply|decide|option)\b/i;
+// Asking the user to run a `!` (bash mode) command takes `! cmd` or `!cmd`. The
+// verb has to lead into the command, so a report that merely mentions `!` and,
+// elsewhere, a word like "run" ("removed `!important`; tests run green") is not
+// a request. Two shapes: the verb a few words before the command on one line,
+// or a lead-in line ending in a colon above a (fenced) command line.
+const BANG_REQUESTS = [
+  /\b(?:run|type|enter|execute|paste)\b[^\n.`]{0,30}(?:`\s*!\s*[a-z]|\s!\s+[a-z])/i,
+  /\b(?:run|type|enter|execute|paste|log ?in|authenticate)\b[^\n]*:[ \t]*\n+(?:[ \t]*```[^\n]*\n)?[ \t]*!\s*[a-z]/i,
+];
+
+function lastLines(text) {
+  return text
+    .split("\n")
+    .map((l) => l.trimEnd())
+    .filter((l) => l.trim() !== "");
+}
+
+// Markdown decoration after a question mark ("**Which one?**") must not hide it.
+function endsWithQuestion(line) {
+  return /\?[\s*_"'’”)\]]*$/.test(line);
+}
+
+// The inference fallback, for a message with no marker. Deliberately narrow:
+// the last line asks something, the message ends in an options list that is
+// introduced by a question, or it asks the user to run a `!` command. A false
+// positive costs a glance at a session; a false negative is today's behaviour.
+function looksLikeAskingTheUser(text) {
+  const lines = lastLines(text);
+  if (lines.length === 0) return false;
+  if (endsWithQuestion(lines.at(-1))) return true;
+
+  let start = lines.length;
+  while (start > 0 && LIST_ITEM.test(lines[start - 1])) start -= 1;
+  if (lines.length - start >= 2 && start > 0) {
+    const intro = lines[start - 1];
+    if (endsWithQuestion(intro) || (/:\s*$/.test(intro) && OPTION_CUE.test(intro))) return true;
+  }
+
+  const tail = text.slice(-INFERENCE_TAIL_CHARS);
+  return BANG_REQUESTS.some((re) => re.test(tail));
+}
+
+// Is a session that just stopped waiting on the user? The marker (last non-empty
+// line only, so a message that merely discusses it doesn't trigger) always
+// counts. Without one, a message that asks something counts unless the session
+// delivered a report this turn: a stacked child that told the supervisor it is
+// waiting on a base, or one that finished and reported, has nothing for the
+// user to do even if its report ends in a question.
+export function classifyAwaiting({ text, reportedThisTurn }) {
+  if (!text) return null;
+  const last = lastLines(text).at(-1)?.trim() ?? "";
+  if (last.startsWith(NEEDS_INPUT_MARKER)) {
+    const note = boundText(last.slice(NEEDS_INPUT_MARKER.length), NOTE_MAX_CHARS);
+    return { source: "marker", note: note || null };
+  }
+  if (reportedThisTurn) return null;
+  return looksLikeAskingTheUser(text) ? { source: "inferred", note: null } : null;
+}
+
+// Reads one session's records and answers the questions relaying and status
+// need: is the session idle (its last turn ended and nothing is pending), did a
+// SendMessage to the supervisor succeed, and is it waiting on the user.
 export function analyzeTranscript(records, supervisorName) {
   const target = supervisorName.trim().toLowerCase();
   const toSupervisor = new Set();
   let delivered = false;
+  let seq = 0;
+  let lastPromptSeq = 0;
+  let lastDeliveredSeq = 0;
   const turns = [];
 
   for (const record of records) {
@@ -90,6 +172,8 @@ export function analyzeTranscript(records, supervisorName) {
     if (record.isSidechain) continue;
     if (record.type !== "assistant" && record.type !== "user") continue;
     turns.push(record);
+    seq += 1;
+    if (isUserPrompt(record)) lastPromptSeq = seq;
 
     for (const block of contentBlocks(record)) {
       if (
@@ -107,6 +191,7 @@ export function analyzeTranscript(records, supervisorName) {
         isSuccessfulResult(block)
       ) {
         delivered = true;
+        lastDeliveredSeq = seq;
       }
     }
   }
@@ -134,7 +219,11 @@ export function analyzeTranscript(records, supervisorName) {
     lastText = texts.join("\n").trim() || null;
   }
 
-  return { idle, delivered, lastText };
+  const awaiting = idle
+    ? classifyAwaiting({ text: lastText, reportedThisTurn: lastDeliveredSeq > lastPromptSeq })
+    : null;
+
+  return { idle, delivered, lastText, awaiting };
 }
 
 // Control characters are removed rather than escaped: the text is pasted into
@@ -200,6 +289,33 @@ function settle(job, deps, state, reason) {
 // test run, a subagent) isn't re-parsed every two seconds.
 const scratch = new WeakMap();
 
+function currentAnalysis(job, deps, located) {
+  const state = scratch.get(job) ?? { deferrals: 0 };
+  scratch.set(job, state);
+  if (state.mtimeMs !== located.mtimeMs) {
+    const text = deps.readTranscript(located.path);
+    if (text === null) return { state, analysis: null };
+    state.analysis = analyzeTranscript(parseTranscript(text), deps.supervisorName);
+    state.mtimeMs = located.mtimeMs;
+  }
+  return { state, analysis: state.analysis ?? null };
+}
+
+// What a session that has stopped is waiting for, from its transcript:
+// `{source, note}` when it is waiting on the user, null when there is nothing
+// for them to do (or no transcript to tell). Called each poll for a job whose
+// Stop hook has fired, so it must stay cheap: the file is re-read only when
+// its mtime moves. There is no quiet period here, unlike the relay: the hook
+// has already said the turn ended, and a session that carries on flips back
+// to running on its next tool call.
+export function inferAwaiting(job, deps) {
+  if (job.mode !== "interactive" || !job.sessionId) return null;
+  const located = deps.locateTranscript(job.sessionId);
+  if (!located) return null;
+  const { analysis } = currentAnalysis(job, deps, located);
+  return analysis?.idle ? analysis.awaiting : null;
+}
+
 // Called from the job poll for a running interactive job, and from closeJob.
 // Returns a short outcome string; the caller only logs it.
 //
@@ -215,8 +331,12 @@ const scratch = new WeakMap();
 export function relayIfUndelivered(job, deps, { closing = false } = {}) {
   if (job.mode !== "interactive" || !job.sessionId) return "not-applicable";
   if (job.relay) return "already-handled";
-  // A question for the user, already shown on the dashboard.
-  if (job.status === "needs_input") return "needs-input";
+  // A dialog for the user, already shown on the dashboard. A session waiting
+  // on a reply is relayed when it is closed (the last chance), because it may
+  // never have reported; while it stays open the supervisor's notice covers it.
+  if (job.status === "needs_input" && !(closing && job.needsInputReason === "question")) {
+    return "needs-input";
+  }
 
   // A second API process (a stale one still on the port) could have handled
   // it already; the meta file is the one record both of us see.
@@ -230,15 +350,8 @@ export function relayIfUndelivered(job, deps, { closing = false } = {}) {
   if (!located) return "no-transcript";
   if (!closing && deps.now() - located.mtimeMs < QUIET_MS) return "settling";
 
-  const state = scratch.get(job) ?? { deferrals: 0 };
-  scratch.set(job, state);
-  if (state.mtimeMs !== located.mtimeMs) {
-    const text = deps.readTranscript(located.path);
-    if (text === null) return "no-transcript";
-    state.analysis = analyzeTranscript(parseTranscript(text), deps.supervisorName);
-    state.mtimeMs = located.mtimeMs;
-  }
-  const { analysis } = state;
+  const { state, analysis } = currentAnalysis(job, deps, located);
+  if (!analysis) return "no-transcript";
   if (!analysis.idle) return "working";
 
   if (analysis.delivered) {

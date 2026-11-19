@@ -34,6 +34,7 @@ import {
 import { NOTICE_TAG, PEARL_NAME, SESSION as PEARL_SESSION } from "./lib/pearl-session.js";
 import {
   findTranscript,
+  inferAwaiting,
   inputBoxIsEmpty,
   readTranscriptTail,
   relayIfUndelivered,
@@ -123,12 +124,29 @@ function connectionError(paneText) {
 // So an idle session only counts as needs_input for a rendered menu (the
 // "❯ 1." cursor), which prose doesn't produce, e.g. a menu the user opened
 // with a slash command.
-function resolveLiveStatus({ mode, paneText, hookState }) {
-  if (connectionError(paneText)) return "connection_error";
+//
+// A stopped session that is waiting on a reply in plain prose (a question,
+// options, a `!` command to run) is told apart from one with nothing for the
+// user to do by `awaiting`, which comes from the transcript, not the pane: the
+// pane can't tell prose from a dialog, and shows grey suggested-prompt text in
+// the input box that is neither a question nor a reply. The user's reply needs
+// no pane signal either: UserPromptSubmit writes "running" and this stops being
+// asked. It reuses needs_input, with `reason` saying which kind, so every
+// consumer of that status keeps working.
+function resolveLiveState({ mode, paneText, hookState, awaiting = null }) {
+  if (connectionError(paneText)) return { status: "connection_error", reason: null, note: null };
   if (mode === "interactive" && hookState === "idle") {
-    return hasMenuCursor(paneText) ? "needs_input" : "idle";
+    if (hasMenuCursor(paneText)) return { status: "needs_input", reason: "permission", note: null };
+    if (awaiting) return { status: "needs_input", reason: "question", note: awaiting.note ?? null };
+    return { status: "idle", reason: null, note: null };
   }
-  return needsInput(paneText) ? "needs_input" : "running";
+  return needsInput(paneText)
+    ? { status: "needs_input", reason: "permission", note: null }
+    : { status: "running", reason: null, note: null };
+}
+
+function resolveLiveStatus(args) {
+  return resolveLiveState(args).status;
 }
 
 function sessionNameFor(id) {
@@ -329,6 +347,8 @@ function syncJobsFromTmux() {
       mode: meta?.mode ?? "headless",
       sessionId: meta?.sessionId ?? null,
       relay: meta?.relay ?? null,
+      needsInputReason: null,
+      needsInputNote: null,
       tmuxSession: session,
       status: "running",
       startedAt: meta?.startedAt ?? null,
@@ -406,6 +426,17 @@ function tryRelay(job, options) {
   } catch (err) {
     console.warn(`[relay] job ${job.id}: ${err.message}`);
     return "error";
+  }
+}
+
+// Like tryRelay, a courtesy that must never break the poll: when the transcript
+// can't be read the session simply stays idle, which is what it showed before.
+function tryAwaiting(job) {
+  try {
+    return inferAwaiting(job, relayDeps);
+  } catch (err) {
+    console.warn(`[awaiting] job ${job.id}: ${err.message}`);
+    return null;
   }
 }
 
@@ -548,11 +579,16 @@ function pollRunningJobs() {
     // connectionError() is true only when nothing (a dialog included) follows
     // the error, and needsInput() alone cannot tell an old dialog from a live
     // one, so resolveLiveStatus asks the connection error first.
-    job.status = resolveLiveStatus({
+    const hookState = job.mode === "interactive" ? readHookState(job.id) : null;
+    const state = resolveLiveState({
       mode: job.mode,
       paneText: pane,
-      hookState: job.mode === "interactive" ? readHookState(job.id) : null,
+      hookState,
+      awaiting: hookState === "idle" ? tryAwaiting(job) : null,
     });
+    job.status = state.status;
+    job.needsInputReason = state.reason;
+    job.needsInputNote = state.note;
     trackConnectionError(job);
     // A "running" or "idle" job is relayed: idle is exactly the session that
     // stopped its turn, which is the one that may have ended without reporting
@@ -602,6 +638,8 @@ export function startCommandJob({
     mode,
     sessionId,
     relay: null,
+    needsInputReason: null,
+    needsInputNote: null,
     tmuxSession: session,
     status: "running",
     startedAt: now,
@@ -858,6 +896,7 @@ export const __test__ = {
   needsInput,
   isLive,
   resolveLiveStatus,
+  resolveLiveState,
   hookSettings,
   stateFilePath,
   readHookState,

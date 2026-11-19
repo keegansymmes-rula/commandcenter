@@ -92,7 +92,7 @@ function SessionCard({ job, onClose }) {
           <span className="session-needs-input">needs input</span>
         )}
         {job.status === "idle" && (
-          <span className="session-idle" title="The agent stopped and is waiting for you — close it when you're done">
+          <span className="session-idle" title="The agent stopped and has nothing for you to do right now — close it when you're done">
             idle
           </span>
         )}
