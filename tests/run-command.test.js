@@ -1376,6 +1376,36 @@ describe("supervisor notice for a session waiting on a reply", () => {
     expect(sent).toHaveLength(1);
   });
 
+  it("keeps a marker another process wrote for the question this one is only now seeing", async () => {
+    const t = await load();
+    const job = addJob(t);
+    turns.set(job.id, "msg_1");
+    t.pollRunningJobs();
+
+    // Another API process announced msg_2 before this one polled it.
+    writeFileSync(t.questionNoticeMarkerPath(job.id), "notified turn=msg_2 2026-11-19T00:00:00.000Z\n");
+    turns.set(job.id, "msg_2");
+    at(1000);
+    t.pollRunningJobs();
+    expect(existsSync(t.questionNoticeMarkerPath(job.id))).toBe(true);
+
+    at(1000 + t.QUESTION_NOTICE_DELAY_MS + t.QUESTION_NOTICE_MIN_GAP_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(0);
+  });
+
+  it("replaces a marker for an earlier question when it announces the new one", async () => {
+    const t = await load();
+    const job = addJob(t);
+    turns.set(job.id, "msg_2");
+    writeFileSync(t.questionNoticeMarkerPath(job.id), "notified turn=msg_1 2026-11-19T00:00:00.000Z\n");
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+    expect(readFileSync(t.questionNoticeMarkerPath(job.id), "utf-8")).toContain("turn=msg_2");
+  });
+
   it("does not announce a question whose marker on disk is for the same question", async () => {
     const t = await load();
     const job = addJob(t);

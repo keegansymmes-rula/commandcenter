@@ -709,13 +709,14 @@ function trackQuestion(job, now) {
     job.questionSince = now;
     job.questionNoticeDone = false;
     job.questionNoticeAttempts = 0;
-    if (marker) removeQuietly(marker);
   }
   job.questionTurn = turn;
 
-  if (!job.questionNoticeDone && marker && existsSync(marker)) {
-    if (markerIsForCurrentQuestion(marker, job)) job.questionNoticeDone = true;
-    else removeQuietly(marker);
+  // A marker is never deleted here, only read: another process may have just
+  // written one for the question this process is only now seeing. A marker for
+  // an earlier question is replaced when the new one is sent.
+  if (!job.questionNoticeDone && marker && existsSync(marker) && markerIsForCurrentQuestion(marker, job)) {
+    job.questionNoticeDone = true;
   }
 }
 
