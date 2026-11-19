@@ -237,6 +237,17 @@ describe("analyzeTranscript: awaiting", () => {
     expect(analyze([assistantText("Which option do you want?")]).awaiting?.source).toBe("inferred");
   });
 
+  it("says which assistant message the question came from, so a later question is a different one", () => {
+    const first = analyze([assistantText("Which option?", { msg: "msg_1" })]).awaiting;
+    const second = analyze([
+      assistantText("Which option?", { msg: "msg_1" }),
+      user("option 2"),
+      assistantText("Which branch?", { msg: "msg_2" }),
+    ]).awaiting;
+    expect(first.turn).toBe("msg_1");
+    expect(second.turn).toBe("msg_2");
+  });
+
   it("counts a report delivered after the last user prompt", () => {
     const r = analyze([
       user("do the work"),

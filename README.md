@@ -107,6 +107,18 @@ you to run a `!` command, unless the session delivered its report that turn
 carries `needsInputReason: "question"` and `needsInputNote`; a permission prompt
 or menu is `needsInputReason: "permission"`.
 
+When a session has held `question` for about 15 seconds the API types a single
+`[cc-notice]` line into the supervisor's terminal. Sessions that stop together
+share one line (at most 5 named, then a count), lines are at least a minute
+apart, and each session is announced once per question. A marker file under the
+jobs dir records which of the session's messages the announced question came
+from, so an API restart does not repeat it but a later question does, even if
+no poll saw the session leave the state in between. Two API processes
+(`DASHBOARD_PORT`) take a lock file before sending, recheck the markers while
+holding it, and read the time of the last notice from a shared file, so they
+neither announce twice nor each keep their own rate limit. The dashboard's
+"needs input" badge says on hover whether it is a reply or a permission prompt.
+
 Every dispatched prompt starts with `/automodel`
 (`commands/automodel.md`), so the agent picks haiku, sonnet, or opus for
 the task before starting it, and ends with an instruction to report back to
