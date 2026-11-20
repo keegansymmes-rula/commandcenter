@@ -16,6 +16,7 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { latestOnly } from "./latestOnly.js";
 import { isLiveStatus } from "./jobStatus.js";
+import { openTerminal } from "./openTerminal.js";
 import { TicketColumn } from "./TicketColumn.jsx";
 import { TodoColumn } from "./TodoColumn.jsx";
 import { PrColumn } from "./PrColumn.jsx";
@@ -121,7 +122,9 @@ export function FocusBoard() {
         // terminal immediately instead of leaving the human to go find
         // the row and click iTerm themselves right after asking for it.
         if (mode === "interactive" && data.job?.id) {
-          fetch(`/api/jobs/${data.job.id}/open-terminal`, { method: "POST" });
+          openTerminal(data.job.id).then((result) => {
+            if (!result.ok) setDispatchError(`Couldn't open the terminal: ${result.error}`);
+          });
         }
         return true;
       } catch (err) {
