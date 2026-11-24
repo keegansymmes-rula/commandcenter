@@ -15,6 +15,7 @@
 
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { latestOnly } from "./latestOnly.js";
+import { pollFetch } from "./pollFetch.js";
 import { isLiveStatus } from "./jobStatus.js";
 import { openTerminal } from "./openTerminal.js";
 import { TicketColumn } from "./TicketColumn.jsx";
@@ -37,16 +38,19 @@ export function FocusBoard() {
   const [jobs, setJobs] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
+  // Once a load has succeeded, a failed refresh must not blank the board.
+  const [hasData, setHasData] = useState(false);
   const [dispatchError, setDispatchError] = useState(null);
 
   const fetchTickets = useCallback(async () => {
     try {
-      const res = await fetch("/api/tickets");
+      const res = await pollFetch("/api/tickets");
       if (!res.ok) throw new Error(`API error: ${res.status}`);
       const data = await res.json();
       setTickets(data.tickets || []);
       setJiraBaseUrl(data.jiraBaseUrl);
       if (data.pearlName) setPearlName(data.pearlName);
+      setHasData(true);
       setError(null);
     } catch (err) {
       setError(err.message);
@@ -237,7 +241,7 @@ export function FocusBoard() {
   }, [liveJobCount, jobs.length, fetchTickets]);
 
   if (loading) return <div className="loading">Loading focus board...</div>;
-  if (error) return <div className="error">Error: {error}</div>;
+  if (error && !hasData) return <div className="error">Error: {error}</div>;
 
   const tabs = focusTabs(pearlName);
 
@@ -255,6 +259,12 @@ export function FocusBoard() {
           </button>
         </div>
       </div>
+
+      {error && (
+        <div className="focus-column-error">
+          Couldn't refresh tickets ({error}); showing the last data. Retrying.
+        </div>
+      )}
 
       <div className="focus-columns">
         <div className="focus-tabbed-pane">

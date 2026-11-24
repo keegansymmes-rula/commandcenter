@@ -7,6 +7,7 @@
 
 import { useCallback, useEffect, useState } from "react";
 import { daysUntil, dueTone, formatDue } from "./dueDate.js";
+import { pollFetch } from "./pollFetch.js";
 
 export function TodoColumn({ jiraBaseUrl }) {
   const [tasks, setTasks] = useState([]);
@@ -18,7 +19,7 @@ export function TodoColumn({ jiraBaseUrl }) {
 
   const fetchTasks = useCallback(async () => {
     try {
-      const res = await fetch("/api/todos");
+      const res = await pollFetch("/api/todos");
       const data = await res.json();
       if (!data.ok) {
         setNotConfigured(true);
