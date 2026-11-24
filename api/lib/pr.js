@@ -1,5 +1,14 @@
-import { execSync } from "node:child_process";
+import { execFile, execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+
+// An unbounded gh call hung for hours after a network stall and, under
+// execSync, froze the whole API (every route queued behind it, so the board
+// never left "Loading"). Bound every call; SIGKILL because gh can ignore TERM
+// while stuck on a socket.
+const GH_TIMEOUT_MS = 30_000;
 
 function run(cmd, cwd) {
   try {
@@ -7,6 +16,8 @@ function run(cmd, cwd) {
       cwd,
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
+      timeout: GH_TIMEOUT_MS,
+      killSignal: "SIGKILL",
     }).trim();
   } catch {
     return null;
@@ -78,14 +89,27 @@ export function prState(branch, { base, state = "all", cwd, fields } = {}) {
 // `role` is "author" or "assignee"; GitHub treats these as distinct from
 // each other and from review-requests, so callers wanting both call this
 // twice and merge rather than this trying to guess a combined meaning.
-export function searchMyPrs({ role = "author", state = "open", limit = 30 } = {}) {
+//
+// Async (not `run`) because /api/prs polls this: a slow GitHub must not block
+// the event loop for every other route.
+export async function searchMyPrs({ role = "author", state = "open", limit = 30 } = {}) {
   const flag = role === "assignee" ? "--assignee=@me" : "--author=@me";
-  const result = run(
-    `gh search prs ${flag} --state=${state} --json repository,number,title,state,url,isDraft,updatedAt --limit ${limit}`,
-  );
-  if (!result) return [];
   try {
-    return JSON.parse(result);
+    const { stdout } = await execFileAsync(
+      "gh",
+      [
+        "search",
+        "prs",
+        flag,
+        `--state=${state}`,
+        "--json",
+        "repository,number,title,state,url,isDraft,updatedAt",
+        "--limit",
+        String(limit),
+      ],
+      { encoding: "utf-8", timeout: GH_TIMEOUT_MS, killSignal: "SIGKILL" },
+    );
+    return JSON.parse(stdout.trim());
   } catch {
     return [];
   }
