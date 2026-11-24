@@ -1,5 +1,20 @@
 import { execFile, execSync } from "node:child_process";
 import { readFileSync } from "node:fs";
+import { promisify } from "node:util";
+
+const execFileAsync = promisify(execFile);
+
+// An unbounded gh call hung for hours after a network stall and, under
+// execSync, froze the whole API (every route queued behind it, so the board
+// never left "Loading"). Bound every call; SIGKILL because gh can ignore TERM
+// while stuck on a socket. GH_TIMEOUT_MS overrides the default so tests can
+// exercise the deadline without waiting 30s; read per call, not at import.
+const DEFAULT_GH_TIMEOUT_MS = 30_000;
+
+function ghTimeoutMs() {
+  const override = Number(process.env.GH_TIMEOUT_MS);
+  return override > 0 ? override : DEFAULT_GH_TIMEOUT_MS;
+}
 
 function run(cmd, cwd) {
   try {
@@ -7,6 +22,8 @@ function run(cmd, cwd) {
       cwd,
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
+      timeout: ghTimeoutMs(),
+      killSignal: "SIGKILL",
     }).trim();
   } catch {
     return null;
@@ -78,35 +95,53 @@ export function prState(branch, { base, state = "all", cwd, fields } = {}) {
 // `role` is "author" or "assignee"; GitHub treats these as distinct from
 // each other and from review-requests, so callers wanting both call this
 // twice and merge rather than this trying to guess a combined meaning.
-export function searchMyPrs({ role = "author", state = "open", limit = 30 } = {}) {
+//
+// Async (not `run`) because /api/prs polls this: a slow GitHub must not block
+// the event loop for every other route.
+export async function searchMyPrs({ role = "author", state = "open", limit = 30 } = {}) {
   const flag = role === "assignee" ? "--assignee=@me" : "--author=@me";
-  const result = run(
-    `gh search prs ${flag} --state=${state} --json repository,number,title,state,url,isDraft,updatedAt --limit ${limit}`,
-  );
-  if (!result) return [];
   try {
-    return JSON.parse(result);
+    const { stdout } = await execFileAsync(
+      "gh",
+      [
+        "search",
+        "prs",
+        flag,
+        `--state=${state}`,
+        "--json",
+        "repository,number,title,state,url,isDraft,updatedAt",
+        "--limit",
+        String(limit),
+      ],
+      { encoding: "utf-8", timeout: ghTimeoutMs(), killSignal: "SIGKILL" },
+    );
+    return JSON.parse(stdout.trim());
   } catch {
     return [];
   }
 }
 
-const GH_TIMEOUT_MS = 20_000;
-
 // Unlike run(), a failure here must reach the caller: "gh isn't logged in"
 // rendered as an empty review queue would read as "nothing to review".
 // Async, because the dashboard polls this every minute and a slow search must
 // not stall the API's other routes (session updates, dispatch) for its duration.
+// Shares ghTimeoutMs()/SIGKILL with the other gh callers: a second deadline
+// here would be one more place for a stalled gh to outlive its timeout.
 function runStrict(args) {
   return new Promise((resolve, reject) => {
-    execFile("gh", args, { encoding: "utf-8", timeout: GH_TIMEOUT_MS }, (err, stdout, stderr) => {
-      if (err) {
-        const detail = String(stderr || err.message || "").trim();
-        reject(new Error(`gh search failed: ${detail || "unknown error"}`));
-        return;
-      }
-      resolve(String(stdout).trim());
-    });
+    execFile(
+      "gh",
+      args,
+      { encoding: "utf-8", timeout: ghTimeoutMs(), killSignal: "SIGKILL" },
+      (err, stdout, stderr) => {
+        if (err) {
+          const detail = String(stderr || err.message || "").trim();
+          reject(new Error(`gh search failed: ${detail || "unknown error"}`));
+          return;
+        }
+        resolve(String(stdout).trim());
+      },
+    );
   });
 }
 

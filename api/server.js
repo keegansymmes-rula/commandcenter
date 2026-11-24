@@ -225,8 +225,10 @@ app.post("/api/jobs/:id/close", async (request, reply) => {
 // so this needs no DEV_ROOT or local clone.
 app.get("/api/prs", async () => {
   try {
-    const authored = searchMyPrs({ role: "author" });
-    const assigned = searchMyPrs({ role: "assignee" });
+    const [authored, assigned] = await Promise.all([
+      searchMyPrs({ role: "author" }),
+      searchMyPrs({ role: "assignee" }),
+    ]);
 
     const byUrl = new Map();
     for (const pr of authored) byUrl.set(pr.url, { pr, roles: ["author"] });

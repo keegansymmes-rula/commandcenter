@@ -73,7 +73,11 @@ describe("searchReviewRequestedPrs", () => {
   it("bounds the call with a timeout", async () => {
     ghReturns("[]");
     await searchReviewRequestedPrs();
-    expect(execFile.mock.calls[0][2].timeout).toBeGreaterThan(0);
+    const opts = execFile.mock.calls[0][2];
+    expect(opts.timeout).toBeGreaterThan(0);
+    // gh can ignore SIGTERM while stuck on a socket; only SIGKILL guarantees
+    // the deadline holds.
+    expect(opts.killSignal).toBe("SIGKILL");
   });
 
   it("returns the parsed list", async () => {
