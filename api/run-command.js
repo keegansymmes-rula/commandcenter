@@ -415,9 +415,20 @@ function deliverToSupervisor(message) {
   );
 }
 
+// True while an agent this job asked the supervisor for is still open and has
+// not settled its own relay (it has not reported, or been relayed, yet). The
+// requester is waiting on it, not finished, so its own relay must hold off.
+function hasOpenRequests(job) {
+  for (const other of jobs.values()) {
+    if (other.requestedBy === job.id && isLive(other.status) && !other.relay) return true;
+  }
+  return false;
+}
+
 const relayDeps = {
   supervisorName: PEARL_NAME,
   now: () => Date.now(),
+  hasOpenRequests,
   readPersisted: readMetaFile,
   persist: persistRelay,
   claim: claimRelay,
@@ -1182,6 +1193,7 @@ export const __test__ = {
   pollRunningJobs,
   syncJobsFromTmux,
   supervisorState,
+  hasOpenRequests,
   deliverToSupervisor,
   persistRelay,
   claimRelay,

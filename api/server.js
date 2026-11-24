@@ -659,6 +659,9 @@ app.post("/api/dispatch", async (request, reply) => {
   // dispatches at once (or for a requester closed in the meantime) and let the
   // per-requester cap be exceeded. Nothing below awaits before startCommandJob
   // registers the job, so this view of the jobs is still true when it does.
+  // The cap is a guard against runaway fan-out, not an exact invariant: a
+  // second API process (DASHBOARD_PORT) could pass it in the same instant, the
+  // same limit the per-ticket 409 below has, and not worth a cross-process lock.
   const requestError = checkRequestedBy(requestedBy, listJobs(), isLive);
   if (requestError) {
     reply.code(400);

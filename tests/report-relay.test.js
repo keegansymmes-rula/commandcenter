@@ -528,6 +528,7 @@ describe("relayIfUndelivered", () => {
   let supervisor;
   let transcript;
   let claimHeld;
+  let openRequests;
   let deps;
 
   const idleUndelivered = () => [assistantText("The work is finished; PR #1 is up.")];
@@ -548,10 +549,12 @@ describe("relayIfUndelivered", () => {
     events = [];
     supervisor = "ready";
     claimHeld = false;
+    openRequests = false;
     transcript = { records: idleUndelivered(), mtimeMs: T0 - 60_000 };
     deps = {
       supervisorName: "Jarvis",
       now: () => now,
+      hasOpenRequests: () => openRequests,
       readPersisted: () => persisted,
       persist: (job) => {
         events.push(`persist:${job.relay.state}`);
@@ -644,6 +647,29 @@ describe("relayIfUndelivered", () => {
       now = T0 + 60_000;
       expect(relayIfUndelivered(job, deps)).toBe("sent");
       expect(delivered[0]).toContain("UNDELIVERED to Jarvis: PR #5 merged.");
+    });
+
+    it("keeps waiting after the first of two relayed results, while the second agent is open", () => {
+      transcript.records = [
+        requestTo("Jarvis", "t1"),
+        okResult("t1"),
+        requestTo("Jarvis", "t2"),
+        okResult("t2"),
+        assistantText("Waiting on both."),
+        relayedResult(),
+        assistantText("First one is in. Still waiting on the second."),
+      ];
+      openRequests = true;
+      const job = makeJob();
+      expect(relayIfUndelivered(job, deps)).toBe("waiting-on-agent");
+      expect(delivered).toHaveLength(0);
+      expect(job.relay).toBeNull();
+    });
+
+    it("is relayed once no agent it asked for is open and it never reported", () => {
+      transcript.records = [...waiting(), relayedResult(), assistantText("Got the result; stopping here.")];
+      openRequests = false;
+      expect(relayIfUndelivered(makeJob(), deps)).toBe("sent");
     });
 
     it("is relayed when it is closed while still waiting, the last chance", () => {

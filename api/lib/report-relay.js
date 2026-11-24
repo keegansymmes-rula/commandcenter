@@ -382,8 +382,14 @@ export function relayIfUndelivered(job, deps, { closing = false } = {}) {
 
   // Not settled: when the result arrives and the session finishes, this runs
   // again for the completion report. A close is the last chance, so a requester
-  // closed while it waits is still relayed.
-  if (analysis.waitingOnAgent && !closing) return "waiting-on-agent";
+  // closed while it waits is still relayed. Two ways to be waiting: the
+  // transcript shows a request no prompt has followed yet (the supervisor may
+  // not have dispatched it), or an agent it requested is still open. The second
+  // covers a requester with several requests out, where the first relayed
+  // result is a prompt that ends the transcript's view of the wait.
+  if (!closing && (analysis.waitingOnAgent || deps.hasOpenRequests(job))) {
+    return "waiting-on-agent";
+  }
 
   if (analysis.delivered) {
     settle(job, deps, "delivered");

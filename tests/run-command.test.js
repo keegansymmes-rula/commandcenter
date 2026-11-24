@@ -150,6 +150,38 @@ describe("serializeJob requestedBy", () => {
   });
 });
 
+describe("hasOpenRequests", () => {
+  const { jobs, hasOpenRequests } = __test__;
+  const child = (over) => ({ id: "c1", requestedBy: "req", status: "running", relay: null, ...over });
+
+  afterEach(() => jobs.clear());
+
+  it("is true while an agent the job asked for is live and has not settled its relay", () => {
+    for (const status of ["running", "idle", "needs_input", "connection_error"]) {
+      jobs.clear();
+      jobs.set("c1", child({ status }));
+      expect(hasOpenRequests({ id: "req" })).toBe(true);
+    }
+  });
+
+  it("is false once the requested agent has reported, been relayed, or finished", () => {
+    jobs.set("c1", child({ relay: { state: "delivered" } }));
+    expect(hasOpenRequests({ id: "req" })).toBe(false);
+    jobs.set("c1", child({ status: "failed" }));
+    expect(hasOpenRequests({ id: "req" })).toBe(false);
+  });
+
+  it("only counts agents this job asked for", () => {
+    jobs.set("c1", child({ requestedBy: "someone-else" }));
+    jobs.set("c2", child({ id: "c2", requestedBy: null }));
+    expect(hasOpenRequests({ id: "req" })).toBe(false);
+  });
+
+  it("is false when the requested agent has been closed and is gone from the list", () => {
+    expect(hasOpenRequests({ id: "req" })).toBe(false);
+  });
+});
+
 describe("tryRelay", () => {
   it("never lets a relay failure escape into polling or closing", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
