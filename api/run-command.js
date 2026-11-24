@@ -93,7 +93,7 @@ function needsInput(paneText) {
   return NEEDS_INPUT_MENU_CURSOR.test(tail);
 }
 
-function isLive(status) {
+export function isLive(status) {
   return LIVE_STATUSES.has(status);
 }
 
@@ -255,12 +255,18 @@ function connectionErrorMarkerPath(id) {
 // An interactive session is started with a --session-id we choose, so its
 // transcript path is known up front (~/.claude/projects/*/<id>.jsonl) and
 // report-relay.js can read it without guessing which session is whose.
-function innerCommand({ promptFile, exitFile, stateFile, mode, extraArgs = "", sessionId }) {
+//
+// `name` makes the session addressable by SendMessage (the same --name trick
+// Pearl uses), so the supervisor can relay a requested agent's report back to
+// the agent that asked for it. It is only ever our own tmux session name
+// (ccenter-<uuid>), so it needs no shell quoting.
+function innerCommand({ promptFile, exitFile, stateFile, mode, extraArgs = "", sessionId, name }) {
   const suffix = extraArgs ? ` ${extraArgs}` : "";
   if (mode === "interactive") {
     const session = sessionId ? ` --session-id ${sessionId}` : "";
+    const named = name && SAFE_ID.test(name) ? ` --name ${name}` : "";
     const hooks = stateFile ? ` --settings '${hookSettings(stateFile)}'` : "";
-    return `claude "$(cat '${promptFile}')" --permission-mode auto${session}${hooks}${suffix}`;
+    return `claude "$(cat '${promptFile}')" --permission-mode auto${session}${named}${hooks}${suffix}`;
   }
   return `claude -p "$(cat '${promptFile}')" --permission-mode auto${suffix}; echo $? > '${exitFile}'`;
 }
@@ -345,6 +351,7 @@ function syncJobsFromTmux() {
     jobs.set(id, {
       id,
       ticketKey: meta?.ticketKey ?? null,
+      requestedBy: meta?.requestedBy ?? null,
       title: meta?.title ?? null,
       prompt: meta?.prompt ?? "(tmux session adopted — no local metadata)",
       cwd: meta?.cwd ?? null,
@@ -408,9 +415,20 @@ function deliverToSupervisor(message) {
   );
 }
 
+// True while an agent this job asked the supervisor for is still open and has
+// not settled its own relay (it has not reported, or been relayed, yet). The
+// requester is waiting on it, not finished, so its own relay must hold off.
+function hasOpenRequests(job) {
+  for (const other of jobs.values()) {
+    if (other.requestedBy === job.id && isLive(other.status) && !other.relay) return true;
+  }
+  return false;
+}
+
 const relayDeps = {
   supervisorName: PEARL_NAME,
   now: () => Date.now(),
+  hasOpenRequests,
   readPersisted: readMetaFile,
   persist: persistRelay,
   claim: claimRelay,
@@ -861,9 +879,13 @@ setInterval(pollRunningJobs, POLL_INTERVAL_MS);
 //
 // `extraArgs` is a pre-quoted shell string fragment appended to the `claude`
 // invocation (currently just the brain dir's `--add-dir`).
+//
+// `requestedBy` is the id of the job whose agent asked the supervisor for this
+// one (see lib/agent-request.js); null for a dispatch the user asked for.
 export function startCommandJob({
   id = randomUUID(),
   ticketKey,
+  requestedBy = null,
   title,
   prompt,
   cwd,
@@ -877,6 +899,7 @@ export function startCommandJob({
   const job = {
     id,
     ticketKey,
+    requestedBy,
     title,
     prompt,
     cwd,
@@ -896,7 +919,7 @@ export function startCommandJob({
   jobs.set(id, job);
 
   writeFileSync(promptFilePath(id), prompt, "utf-8");
-  writeMetaFile(id, { id, ticketKey, title, prompt, cwd, mode, sessionId, startedAt: now });
+  writeMetaFile(id, { id, ticketKey, requestedBy, title, prompt, cwd, mode, sessionId, startedAt: now });
 
   try {
     execFileSync("tmux", [
@@ -915,6 +938,7 @@ export function startCommandJob({
         mode,
         extraArgs,
         sessionId,
+        name: session,
       }),
     ]);
     // Without this, tmux kills the pane the instant the inner command exits —
@@ -1169,6 +1193,7 @@ export const __test__ = {
   pollRunningJobs,
   syncJobsFromTmux,
   supervisorState,
+  hasOpenRequests,
   deliverToSupervisor,
   persistRelay,
   claimRelay,

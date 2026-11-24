@@ -118,6 +118,70 @@ describe("innerCommand session id", () => {
   });
 });
 
+describe("innerCommand name", () => {
+  const base = { promptFile: "/tmp/x.prompt", exitFile: "/tmp/x.exit" };
+
+  it("names an interactive session so SendMessage can reach it by its session name", () => {
+    const cmd = innerCommand({ ...base, mode: "interactive", name: sessionNameFor("abc-123") });
+    expect(cmd).toContain("--name ccenter-abc-123");
+  });
+
+  it("puts the name before any extra args", () => {
+    const cmd = innerCommand({ ...base, mode: "interactive", name: "ccenter-a", extraArgs: "--add-dir '/b'" });
+    expect(cmd.indexOf("--name")).toBeLessThan(cmd.indexOf("--add-dir"));
+  });
+
+  it("leaves it off headless runs and when none is given", () => {
+    expect(innerCommand({ ...base, name: "ccenter-a" })).not.toContain("--name");
+    expect(innerCommand({ ...base, mode: "interactive" })).not.toContain("--name");
+  });
+
+  it("never splices an unsafe name into the shell string", () => {
+    const cmd = innerCommand({ ...base, mode: "interactive", name: "a; rm -rf ~" });
+    expect(cmd).not.toContain("--name");
+    expect(cmd).not.toContain("rm -rf");
+  });
+});
+
+describe("serializeJob requestedBy", () => {
+  it("keeps the requester id, so the supervisor and dashboard can see who asked", () => {
+    const job = { id: "child", requestedBy: "req-1", log: "output" };
+    expect(serializeJob(job).requestedBy).toBe("req-1");
+  });
+});
+
+describe("hasOpenRequests", () => {
+  const { jobs, hasOpenRequests } = __test__;
+  const child = (over) => ({ id: "c1", requestedBy: "req", status: "running", relay: null, ...over });
+
+  afterEach(() => jobs.clear());
+
+  it("is true while an agent the job asked for is live and has not settled its relay", () => {
+    for (const status of ["running", "idle", "needs_input", "connection_error"]) {
+      jobs.clear();
+      jobs.set("c1", child({ status }));
+      expect(hasOpenRequests({ id: "req" })).toBe(true);
+    }
+  });
+
+  it("is false once the requested agent has reported, been relayed, or finished", () => {
+    jobs.set("c1", child({ relay: { state: "delivered" } }));
+    expect(hasOpenRequests({ id: "req" })).toBe(false);
+    jobs.set("c1", child({ status: "failed" }));
+    expect(hasOpenRequests({ id: "req" })).toBe(false);
+  });
+
+  it("only counts agents this job asked for", () => {
+    jobs.set("c1", child({ requestedBy: "someone-else" }));
+    jobs.set("c2", child({ id: "c2", requestedBy: null }));
+    expect(hasOpenRequests({ id: "req" })).toBe(false);
+  });
+
+  it("is false when the requested agent has been closed and is gone from the list", () => {
+    expect(hasOpenRequests({ id: "req" })).toBe(false);
+  });
+});
+
 describe("tryRelay", () => {
   it("never lets a relay failure escape into polling or closing", () => {
     const warn = vi.spyOn(console, "warn").mockImplementation(() => {});

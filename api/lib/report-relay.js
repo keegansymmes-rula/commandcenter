@@ -92,6 +92,19 @@ export const NEEDS_INPUT_MARKER = "[needs-input]";
 export const NEEDS_INPUT_INSTRUCTION =
   `If your turn ends because you are waiting on the user (a question, a choice between options, or a command for them to run such as a \`!\` login), make the last line of your final message \`${NEEDS_INPUT_MARKER} \` followed by one short sentence saying what you need. Don't add it when you are only waiting on another session, or when there is nothing for the user to do.`;
 
+// A message to the supervisor that starts with this asks for another agent
+// (see agent-request.js); it is not the session's completion report. Counting
+// it as one would settle the requester as "delivered" the moment it goes idle
+// to wait, and a completion report that later failed to send would then never
+// be relayed. Same arrangement as the marker above: the instruction that asks
+// for it lives in agent-request.js, the detector here.
+export const AGENT_REQUEST_MARKER = "[agent-request]";
+
+function isAgentRequest(block) {
+  const message = block.input?.message;
+  return typeof message === "string" && message.trimStart().startsWith(AGENT_REQUEST_MARKER);
+}
+
 const NOTE_MAX_CHARS = 160;
 const INFERENCE_TAIL_CHARS = 600;
 const LIST_ITEM = /^\s*(?:\d{1,2}[.)]|[A-Za-z][.)]|[-*•])\s+\S/;
@@ -157,14 +170,17 @@ export function classifyAwaiting({ text, reportedThisTurn }) {
 
 // Reads one session's records and answers the questions relaying and status
 // need: is the session idle (its last turn ended and nothing is pending), did a
-// SendMessage to the supervisor succeed, and is it waiting on the user.
+// report to the supervisor succeed, is it waiting on another agent it asked the
+// supervisor for, and is it waiting on the user.
 export function analyzeTranscript(records, supervisorName) {
   const target = supervisorName.trim().toLowerCase();
   const toSupervisor = new Set();
+  const requests = new Set();
   let delivered = false;
   let seq = 0;
   let lastPromptSeq = 0;
   let lastDeliveredSeq = 0;
+  let lastRequestSeq = 0;
   const turns = [];
 
   for (const record of records) {
@@ -182,19 +198,22 @@ export function analyzeTranscript(records, supervisorName) {
         block.name === "SendMessage" &&
         String(block.input?.to ?? "").trim().toLowerCase() === target
       ) {
-        toSupervisor.add(block.id);
+        (isAgentRequest(block) ? requests : toSupervisor).add(block.id);
       }
-      if (
-        record.type === "user" &&
-        block.type === "tool_result" &&
-        toSupervisor.has(block.tool_use_id) &&
-        isSuccessfulResult(block)
-      ) {
-        delivered = true;
-        lastDeliveredSeq = seq;
+      if (record.type === "user" && block.type === "tool_result" && isSuccessfulResult(block)) {
+        if (toSupervisor.has(block.tool_use_id)) {
+          delivered = true;
+          lastDeliveredSeq = seq;
+        } else if (requests.has(block.tool_use_id)) {
+          lastRequestSeq = seq;
+        }
       }
     }
   }
+
+  // Asked for an agent since the last prompt (the relayed result arrives as
+  // one) and has not reported since: idle, but waiting on another session.
+  const waitingOnAgent = lastRequestSeq > lastPromptSeq && lastRequestSeq > lastDeliveredSeq;
 
   const last = turns.at(-1);
   const idle =
@@ -223,11 +242,14 @@ export function analyzeTranscript(records, supervisorName) {
   // later question from the same session can be told apart from an earlier one
   // even when no poll saw the session leave the state in between.
   const found = idle
-    ? classifyAwaiting({ text: lastText, reportedThisTurn: lastDeliveredSeq > lastPromptSeq })
+    ? classifyAwaiting({
+        text: lastText,
+        reportedThisTurn: lastDeliveredSeq > lastPromptSeq || waitingOnAgent,
+      })
     : null;
   const awaiting = found ? { ...found, turn: last.message?.id ?? null } : null;
 
-  return { idle, delivered, lastText, awaiting };
+  return { idle, delivered, waitingOnAgent, lastText, awaiting };
 }
 
 // Control characters are removed rather than escaped: the text is pasted into
@@ -357,6 +379,17 @@ export function relayIfUndelivered(job, deps, { closing = false } = {}) {
   const { state, analysis } = currentAnalysis(job, deps, located);
   if (!analysis) return "no-transcript";
   if (!analysis.idle) return "working";
+
+  // Not settled: when the result arrives and the session finishes, this runs
+  // again for the completion report. A close is the last chance, so a requester
+  // closed while it waits is still relayed. Two ways to be waiting: the
+  // transcript shows a request no prompt has followed yet (the supervisor may
+  // not have dispatched it), or an agent it requested is still open. The second
+  // covers a requester with several requests out, where the first relayed
+  // result is a prompt that ends the transcript's view of the wait.
+  if (!closing && (analysis.waitingOnAgent || deps.hasOpenRequests(job))) {
+    return "waiting-on-agent";
+  }
 
   if (analysis.delivered) {
     settle(job, deps, "delivered");

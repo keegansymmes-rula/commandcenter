@@ -1,6 +1,24 @@
 import { describe, expect, it } from "vitest";
 import { __test__ } from "../api/run-command.js";
-import { LIVE_STATUSES as UI_LIVE_STATUSES, isLiveStatus, needsInputTitle } from "../ui/src/jobStatus.js";
+import { LIVE_STATUSES as UI_LIVE_STATUSES, isLiveStatus, needsInputTitle, requestedByTitle } from "../ui/src/jobStatus.js";
+
+describe("requestedByTitle", () => {
+  const jobs = [{ id: "req-1", title: "NEV-9 — fix retries" }, { id: "bare", ticketKey: "NEV-10" }];
+
+  it("is null for a job the user asked for", () => {
+    expect(requestedByTitle({ requestedBy: null }, jobs)).toBeNull();
+    expect(requestedByTitle({}, jobs)).toBeNull();
+  });
+
+  it("names the requester by its title, else its ticket", () => {
+    expect(requestedByTitle({ requestedBy: "req-1" }, jobs)).toContain("NEV-9 — fix retries");
+    expect(requestedByTitle({ requestedBy: "bare" }, jobs)).toContain("NEV-10");
+  });
+
+  it("falls back to the id when the requester has been closed", () => {
+    expect(requestedByTitle({ requestedBy: "gone" }, jobs)).toContain("gone");
+  });
+});
 
 describe("isLiveStatus", () => {
   it.each(["running", "needs_input", "idle", "connection_error"])(

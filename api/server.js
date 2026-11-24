@@ -18,6 +18,7 @@ import {
   closeJob,
   findRunningJobForTicket,
   getJob,
+  isLive,
   listJobs,
   openInIterm,
   serializeJob,
@@ -27,6 +28,7 @@ import { brainInstructions, canvasPathFor, ensureBrainDir, readBrain } from "./b
 import { openPearl, PEARL_NAME, readSoul, refreshPearl, writeSoul } from "./pearl.js";
 import { repoNotFoundError, resolveRepoRoot } from "./lib/util.js";
 import { NEEDS_INPUT_INSTRUCTION } from "./lib/report-relay.js";
+import { agentRequestInstruction, checkRequestedBy } from "./lib/agent-request.js";
 import { loadDevRoot, getJiraAuth } from "./lib/config.js";
 import { announcePr, isAnnounceConfigured, loadPostedUrls } from "./lib/slack-pr-announce.js";
 import { createMemory, findMemoryBin, MemoryError, MemoryExistsError, MemoryNotFoundError } from "./lib/pearl-memory.js";
@@ -522,7 +524,7 @@ app.delete("/api/memory/note", async (request, reply) => {
 // Dispatch a free-form agent, scoped to whatever is focused (a ticket, or
 // nothing). Gated the same way as the rest of the dashboard's write actions.
 app.post("/api/dispatch", async (request, reply) => {
-  const { prompt, context, mode } = request.body || {};
+  const { prompt, context, mode, requestedBy } = request.body || {};
   if (!prompt) {
     reply.code(400);
     return { ok: false, error: "prompt is required" };
@@ -531,7 +533,6 @@ app.post("/api/dispatch", async (request, reply) => {
     reply.code(400);
     return { ok: false, error: 'mode must be "headless" or "interactive"' };
   }
-
   const type = context?.type || "none";
   let cwd = DEV_ROOT;
   let ticketKey = null;
@@ -627,6 +628,15 @@ app.post("/api/dispatch", async (request, reply) => {
     composedPrompt = `${composedPrompt}\n\n${NEEDS_INPUT_INSTRUCTION}`;
   }
 
+  // The id is generated up here (rather than next to the brain dir) because an
+  // interactive agent is told its own job id, so the supervisor knows where to
+  // relay a requested agent's report. A job that was itself requested gets no
+  // such instruction: the server refuses to nest requests (checkRequestedBy).
+  const jobId = randomUUID();
+  if (mode === "interactive" && !requestedBy) {
+    composedPrompt = `${composedPrompt}\n\n${agentRequestInstruction({ supervisor: PEARL_NAME, jobId })}`;
+  }
+
   if (!cwd) {
     reply.code(400);
     return { ok: false, error: "DEV_ROOT is not configured" };
@@ -644,6 +654,20 @@ app.post("/api/dispatch", async (request, reply) => {
     }
   }
 
+  // Checked here, not up with the other body validation: the ticket lookups
+  // above are awaited, so a check made before them can pass for several
+  // dispatches at once (or for a requester closed in the meantime) and let the
+  // per-requester cap be exceeded. Nothing below awaits before startCommandJob
+  // registers the job, so this view of the jobs is still true when it does.
+  // The cap is a guard against runaway fan-out, not an exact invariant: a
+  // second API process (DASHBOARD_PORT) could pass it in the same instant, the
+  // same limit the per-ticket 409 below has, and not worth a cross-process lock.
+  const requestError = checkRequestedBy(requestedBy, listJobs(), isLive);
+  if (requestError) {
+    reply.code(400);
+    return { ok: false, error: requestError };
+  }
+
   // Every dispatched agent gets a brain dir and permission to write to it —
   // the agent decides for itself whether to actually use it (see
   // brainInstructions), not a human at dispatch time. The id has to be
@@ -651,7 +675,6 @@ app.post("/api/dispatch", async (request, reply) => {
   // has to be baked into both composedPrompt (so the agent knows where to
   // write) and the claude invocation's --add-dir (so it's allowed to)
   // before the job/tmux session exists.
-  const jobId = randomUUID();
   const brainDir = ensureBrainDir(jobId);
   composedPrompt = `${composedPrompt}\n\n${brainInstructions(canvasPathFor(jobId))}`;
   const extraArgs = `--add-dir '${brainDir}'`;
@@ -659,6 +682,7 @@ app.post("/api/dispatch", async (request, reply) => {
   const job = startCommandJob({
     id: jobId,
     ticketKey,
+    requestedBy: requestedBy || null,
     title,
     prompt: composedPrompt,
     cwd,
