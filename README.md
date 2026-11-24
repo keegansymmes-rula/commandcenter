@@ -102,10 +102,21 @@ runs in the repo resolved from its labels or description, falling back to
 running job per ticket; a second dispatch returns 409.
 
 An interactive session shows `idle` once the agent stops at its prompt with
-nothing pending, and goes back to `running` when you type into it. The
-session reports this itself: each interactive dispatch carries per-session
-Stop/UserPromptSubmit/PreToolUse hooks (via `--settings`) that write a state
-file under the OS temp dir, which the status poll reads.
+nothing for you to do, and `needs_input` when it stopped waiting on you; either
+goes back to `running` when you type into it. The session reports this itself:
+each interactive dispatch carries per-session Stop/UserPromptSubmit/PreToolUse
+hooks (via `--settings`) that write a state file under the OS temp dir, which
+the status poll reads.
+
+Which of the two a stopped session gets comes from its transcript, not the
+screen (the input box shows grey suggested-prompt text that is neither a question
+nor a reply). The dispatch prompt asks the agent to end a message that waits on
+you with a `[needs-input] <what it needs>` line. An unmarked message counts when
+it ends by asking something, offers an options list after a question, or asks
+you to run a `!` command, unless the session delivered its report that turn
+(a stacked child waiting on its base, or a session that finished). The job then
+carries `needsInputReason: "question"` and `needsInputNote`; a permission prompt
+or menu is `needsInputReason: "permission"`.
 
 Every dispatched prompt starts with `/automodel`
 (`commands/automodel.md`), so the agent picks haiku, sonnet, or opus for
@@ -121,7 +132,8 @@ interactive job: when its session goes idle (or the job is closed while idle)
 without a report having reached the supervisor, it types a one-line relay of
 the session's last message into the supervisor's terminal. The relay is capped
 at a few hundred characters, labelled as automated, and sent at most once per
-job; `needs_input` and still-working jobs are never relayed.
+job; `needs_input` and still-working jobs are never relayed (a session waiting on a
+reply is relayed if it is closed, its last chance).
 
 Detection reads the session's transcript, not the terminal. Interactive jobs
 start with a known `--session-id`, so the transcript is

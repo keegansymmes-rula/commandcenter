@@ -274,6 +274,56 @@ describe("resolveLiveStatus", () => {
   });
 });
 
+describe("resolveLiveState: a stopped session waiting on a reply", () => {
+  const calm = "⏺ Which option do you want?\n\n❯ \n";
+  const state = (over) => __test__.resolveLiveState({ mode: "interactive", paneText: calm, hookState: "idle", ...over });
+  const question = { source: "marker", note: "Pick option 1 or 2." };
+
+  it("is needs_input with reason question when the transcript says it is waiting on the user", () => {
+    expect(state({ awaiting: question })).toEqual({
+      status: "needs_input",
+      reason: "question",
+      note: "Pick option 1 or 2.",
+    });
+  });
+
+  it("stays idle, with no reason, when there is nothing for the user to do", () => {
+    expect(state({ awaiting: null })).toEqual({ status: "idle", reason: null, note: null });
+  });
+
+  it("defaults to idle for a caller that knows nothing about the transcript", () => {
+    expect(resolveLiveStatus({ mode: "interactive", paneText: calm, hookState: "idle" })).toBe("idle");
+  });
+
+  it("leaves needs_input as soon as the user replies, because the hook writes running", () => {
+    expect(state({ hookState: "running", awaiting: question }).status).toBe("running");
+  });
+
+  it("reports a rendered menu as a permission prompt, not a question", () => {
+    const menu = "Select a model:\n❯ 1. Opus\n  2. Sonnet\n";
+    expect(state({ paneText: menu, awaiting: question })).toMatchObject({ status: "needs_input", reason: "permission" });
+  });
+
+  it("reports a permission dialog on a running session with reason permission", () => {
+    const dialog = "Do you want to proceed?\n❯ 1. Yes\n  2. No";
+    expect(state({ paneText: dialog, hookState: "running" })).toMatchObject({ status: "needs_input", reason: "permission" });
+  });
+
+  it("lets a connection error win over a question", () => {
+    const errored = "⏺ Working\n  ⎿  API Error: Connection lost mid-response. The response above may be incomplete.\n";
+    expect(state({ paneText: errored, awaiting: question }).status).toBe("connection_error");
+  });
+
+  it("never reports a question for a headless job", () => {
+    expect(state({ mode: "headless", awaiting: question }).status).toBe("running");
+  });
+
+  it("does not take the grey suggested-prompt text in the input box for a question or a reply", () => {
+    const placeholder = '⏺ All done, PR is up.\n\n❯ Try "fix the lint errors?"\n';
+    expect(state({ paneText: placeholder, awaiting: null }).status).toBe("idle");
+  });
+});
+
 describe("isLive", () => {
   it.each(["running", "needs_input", "idle", "connection_error"])("treats %s as a live session", (status) => {
     expect(isLive(status)).toBe(true);
@@ -806,5 +856,194 @@ describe("connection_error status and supervisor notice", () => {
     expect(out).not.toHaveProperty("noticeAttempts");
     expect(out).not.toHaveProperty("noticeDone");
     expect(out.status).toBe("connection_error");
+  });
+});
+
+describe("needs_input (question) transitions on the poll", () => {
+  const BORDER = "─".repeat(60);
+  const box = (typed = "") => [BORDER, `❯ ${typed}`, BORDER, "  ⏵⏵ auto mode on"].join("\n");
+  const placeholderPane = `⏺ Which option do you want?\n\n${BORDER}\n❯ Try "fix the lint errors"\n${BORDER}`;
+  const files = [];
+
+  let awaiting;
+  let asked;
+  let relayed;
+  let jobPane;
+  let lookupThrows;
+
+  afterEach(() => {
+    for (const path of files.splice(0)) rmSync(path, { force: true });
+    vi.doUnmock("node:child_process");
+    vi.doUnmock("../api/lib/report-relay.js");
+    vi.useRealTimers();
+    vi.resetModules();
+  });
+
+  // Fresh module with tmux stubbed and the transcript lookup replaced by
+  // `awaiting`, so the transitions are tested without a transcript on disk.
+  async function load() {
+    awaiting = null;
+    asked = 0;
+    relayed = [];
+    lookupThrows = false;
+    vi.useFakeTimers();
+    vi.doMock("node:child_process", () => ({
+      execFileSync: (cmd, args) => {
+        if (cmd !== "tmux") throw new Error(`unexpected command: ${cmd}`);
+        if (args[0] === "list-sessions") return "";
+        if (args[0] === "capture-pane") return args.includes("-S") ? jobPane : box();
+        return "";
+      },
+    }));
+    vi.doMock("../api/lib/report-relay.js", async (importOriginal) => ({
+      ...(await importOriginal()),
+      inferAwaiting: () => {
+        asked += 1;
+        if (lookupThrows) throw new Error("EIO");
+        return awaiting;
+      },
+      relayIfUndelivered: (job) => {
+        relayed.push(job.id);
+        return "stubbed";
+      },
+    }));
+    vi.resetModules();
+    return (await import("../api/run-command.js")).__test__;
+  }
+
+  function addJob(t, hook, overrides = {}) {
+    const id = `ni-${randomUUID()}`;
+    const job = {
+      id,
+      mode: "interactive",
+      sessionId: randomUUID(),
+      tmuxSession: `ccenter-${id}`,
+      status: "running",
+      log: "",
+      error: null,
+      ...overrides,
+    };
+    t.jobs.set(id, job);
+    files.push(t.stateFilePath(id));
+    if (hook) writeFileSync(t.stateFilePath(id), hook);
+    return job;
+  }
+
+  it("enters needs_input with reason question when the stopped session is waiting on the user", async () => {
+    const t = await load();
+    const job = addJob(t, "idle");
+    jobPane = placeholderPane;
+    awaiting = { source: "marker", note: "Pick option 1 or 2." };
+    t.pollRunningJobs();
+    expect(job.status).toBe("needs_input");
+    expect(job.needsInputReason).toBe("question");
+    expect(job.needsInputNote).toBe("Pick option 1 or 2.");
+  });
+
+  it("stays idle when the stopped session has nothing for the user to do, placeholder text and all", async () => {
+    const t = await load();
+    const job = addJob(t, "idle");
+    jobPane = placeholderPane;
+    t.pollRunningJobs();
+    expect(job.status).toBe("idle");
+    expect(job.needsInputReason).toBeNull();
+  });
+
+  it("leaves needs_input on the very next poll after the user replies", async () => {
+    const t = await load();
+    const job = addJob(t, "idle");
+    jobPane = placeholderPane;
+    awaiting = { source: "inferred", note: null };
+    t.pollRunningJobs();
+    expect(job.status).toBe("needs_input");
+
+    // UserPromptSubmit writes running; the transcript has not caught up yet.
+    writeFileSync(t.stateFilePath(job.id), "running");
+    t.pollRunningJobs();
+    expect(job.status).toBe("running");
+    expect(job.needsInputReason).toBeNull();
+    expect(job.needsInputNote).toBeNull();
+  });
+
+  it("returns to idle, not needs_input, when the next turn ends with nothing to ask", async () => {
+    const t = await load();
+    const job = addJob(t, "idle");
+    jobPane = placeholderPane;
+    awaiting = { source: "inferred", note: null };
+    t.pollRunningJobs();
+    writeFileSync(t.stateFilePath(job.id), "running");
+    t.pollRunningJobs();
+    writeFileSync(t.stateFilePath(job.id), "idle");
+    awaiting = null;
+    t.pollRunningJobs();
+    expect(job.status).toBe("idle");
+  });
+
+  it("only reads the transcript for an interactive session whose Stop hook has fired", async () => {
+    const t = await load();
+    addJob(t, "running");
+    addJob(t, null);
+    addJob(t, "idle", { mode: "headless" });
+    jobPane = placeholderPane;
+    t.pollRunningJobs();
+    expect(asked).toBe(0);
+  });
+
+  it("keeps a pre-change job (no session id, so no transcript to read) idle", async () => {
+    const t = await load();
+    const job = addJob(t, "idle", { sessionId: null });
+    jobPane = placeholderPane;
+    t.pollRunningJobs();
+    expect(job.status).toBe("idle");
+  });
+
+  it("does not relay a session that is waiting on a reply while it stays open", async () => {
+    const t = await load();
+    const waiting = addJob(t, "idle");
+    jobPane = placeholderPane;
+    awaiting = { source: "marker", note: null };
+    t.pollRunningJobs();
+    expect(relayed).toEqual([]);
+
+    // Once its question is answered and it stops with nothing to ask, the
+    // relay of an unreported last message applies as before.
+    awaiting = null;
+    t.pollRunningJobs();
+    expect(relayed).toEqual([waiting.id]);
+  });
+
+  it("survives a transcript lookup that throws, leaving the session idle", async () => {
+    const t = await load();
+    const job = addJob(t, "idle");
+    jobPane = placeholderPane;
+    lookupThrows = true;
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    t.pollRunningJobs();
+    expect(job.status).toBe("idle");
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
+  it("keeps a needs_input question session counted as live for its ticket", async () => {
+    const t = await load();
+    const job = addJob(t, "idle", { ticketKey: "PROJ-7" });
+    jobPane = placeholderPane;
+    awaiting = { source: "marker", note: null };
+    t.pollRunningJobs();
+    const mod = await import("../api/run-command.js");
+    expect(mod.findRunningJobForTicket("PROJ-7")).toBe(job);
+  });
+
+  it("serializes the reason and note so the dashboard and supervisor can read them", async () => {
+    await load();
+    const mod = await import("../api/run-command.js");
+    const out = mod.serializeJob({
+      id: "abc",
+      status: "needs_input",
+      needsInputReason: "question",
+      needsInputNote: "Pick one.",
+      log: "",
+    });
+    expect(out).toMatchObject({ needsInputReason: "question", needsInputNote: "Pick one." });
   });
 });

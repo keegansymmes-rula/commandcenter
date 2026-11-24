@@ -26,6 +26,7 @@ import {
 import { brainInstructions, canvasPathFor, ensureBrainDir, readBrain } from "./brain.js";
 import { openPearl, PEARL_NAME, readSoul, refreshPearl, writeSoul } from "./pearl.js";
 import { repoNotFoundError, resolveRepoRoot } from "./lib/util.js";
+import { NEEDS_INPUT_INSTRUCTION } from "./lib/report-relay.js";
 import { loadDevRoot, getJiraAuth } from "./lib/config.js";
 import { announcePr, isAnnounceConfigured, loadPostedUrls } from "./lib/slack-pr-announce.js";
 import { createMemory, findMemoryBin, MemoryError, MemoryExistsError, MemoryNotFoundError } from "./lib/pearl-memory.js";
@@ -615,6 +616,14 @@ app.post("/api/dispatch", async (request, reply) => {
   // it the session's last message, which is what run-command.js relays to
   // Pearl when no report got through.
   composedPrompt = `${composedPrompt}\n\n---\n\nWhen you finish — done, failed, or stopping because you're blocked — send ${PEARL_NAME} a brief status via the SendMessage tool: one or two sentences on what happened and whether anything needs human attention. Don't wait for a reply. If SendMessage is denied or errors, retry once; if that fails too, start your final output with "UNDELIVERED to ${PEARL_NAME}:" followed by the same status. /cc-report covers what to include.`;
+
+  // Interactive sessions only: a headless one can't wait on a reply. The
+  // marker is how the dashboard tells "waiting on the user" from "nothing to
+  // do" (see classifyAwaiting in lib/report-relay.js); unmarked messages fall
+  // back to a narrow inference, so this is a precision aid, not a requirement.
+  if (mode === "interactive") {
+    composedPrompt = `${composedPrompt}\n\n${NEEDS_INPUT_INSTRUCTION}`;
+  }
 
   if (!cwd) {
     reply.code(400);

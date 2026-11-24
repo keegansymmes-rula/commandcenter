@@ -6,9 +6,13 @@ import {
   analyzeTranscript,
   boundText,
   buildRelayMessage,
+  classifyAwaiting,
   findTranscript,
+  inferAwaiting,
   inputBoxIsEmpty,
   MAX_DEFERRED_POLLS,
+  NEEDS_INPUT_INSTRUCTION,
+  NEEDS_INPUT_MARKER,
   parseTranscript,
   QUIET_MS,
   readTranscriptTail,
@@ -155,6 +159,177 @@ describe("analyzeTranscript: is the session idle", () => {
       { type: "assistant", message: { id: "m", stop_reason: "end_turn", content: [{ type: "thinking", thinking: "x" }] } },
     ]);
     expect(r.lastText).toBeNull();
+  });
+});
+
+describe("classifyAwaiting: is a stopped session waiting on the user", () => {
+  const ask = (text, reportedThisTurn = false) => classifyAwaiting({ text, reportedThisTurn });
+
+  it("treats the marker on the last line as waiting, and keeps its note", () => {
+    const r = ask(`Two ways to do it.\n\n${NEEDS_INPUT_MARKER} Pick option 1 or 2.`);
+    expect(r).toEqual({ source: "marker", note: "Pick option 1 or 2." });
+  });
+
+  it("accepts a bare marker with no note", () => {
+    expect(ask(`Done.\n${NEEDS_INPUT_MARKER}`)).toEqual({ source: "marker", note: null });
+  });
+
+  it("only reads the marker from the last line, so a message that discusses it does not trigger", () => {
+    const text = `I will end with ${NEEDS_INPUT_MARKER} when I need you.\n\nAll finished, PR is up.`;
+    expect(ask(text)).toBeNull();
+  });
+
+  it("bounds and flattens the note, since it is text nobody vetted", () => {
+    const r = ask(`${NEEDS_INPUT_MARKER} ${"x".repeat(500)}\u001b[201~`);
+    expect(r.note.length).toBeLessThan(220);
+    expect(r.note).not.toMatch(/[\u0000-\u001f]/);
+  });
+
+  it("lets the marker win even when a report was delivered this turn", () => {
+    expect(ask(`Reported.\n${NEEDS_INPUT_MARKER} Run the login.`, true)?.source).toBe("marker");
+  });
+
+  it.each([
+    ["a question on the last line", "I found two causes.\n\nWhich one should I fix first?"],
+    ["a question wrapped in bold", "**Should I go ahead with the migration?**"],
+    ["options introduced by a question", "How should I split it?\n\n1. One PR\n2. Two stacked PRs"],
+    ["options introduced by a colon and a cue", "Choose one of these:\n- Keep the field\n- Drop the field"],
+    ["a `!` command to run", "AWS SSO has expired. Run `! aws sso login --profile sso` and tell me when it is done."],
+    ["a `!` command in a code block", "Please log in:\n\n```\n! aws sso login --profile sso\n```"],
+    ["a compact `!` command", "Please run `!aws sso login` and tell me when done."],
+    ["a compact `!` command at a line start", "Please log in:\n\n```\n!aws sso login --profile sso\n```"],
+  ])("infers waiting from %s", (_name, text) => {
+    expect(ask(text)).toEqual({ source: "inferred", note: null });
+  });
+
+  it.each([
+    ["a finished report", "Opened PR #12 as a draft; CI is green."],
+    ["a question that is not at the end", "Why did it fail? A missing env var. Fixed it, tests pass."],
+    ["a list with no question before it", "Changes:\n- Added the field\n- Updated the tests"],
+    ["a `!` mentioned with no ask", "Added a `!` prefix check in the parser."],
+    ["a `!important` in prose", "Fixed the style: the rule no longer needs !important, and tests run green."],
+    ["a completed report that mentions `!important`", "Removed `!important` from the stylesheet; tests run green."],
+    ["a completed report that mentions a `!` command", "Updated the docs to show `! aws sso login`; users type it themselves."],
+    ["a completed report that mentions a compact `!` command", "The helper now accepts `!aws sso login`, and the tests run clean."],
+    ["no text at all", ""],
+  ])("does not infer waiting from %s", (_name, text) => {
+    expect(ask(text)).toBeNull();
+  });
+
+  it("does not infer waiting when a report was delivered this turn", () => {
+    // A stacked child that told the supervisor it is waiting on its base.
+    expect(ask("Reported to the supervisor. Want me to start once PR 1 merges?", true)).toBeNull();
+  });
+
+  it("tells the dispatched agent exactly the marker it detects", () => {
+    expect(NEEDS_INPUT_INSTRUCTION).toContain(`\`${NEEDS_INPUT_MARKER} \``);
+  });
+});
+
+describe("analyzeTranscript: awaiting", () => {
+  const user = (content) => ({ type: "user", message: { content } });
+
+  it("is null while the session is still working", () => {
+    expect(analyze([assistantTool("Bash", {}, "t1")]).awaiting).toBeNull();
+  });
+
+  it("is set for an idle session whose last message asks the user something", () => {
+    expect(analyze([assistantText("Which option do you want?")]).awaiting?.source).toBe("inferred");
+  });
+
+  it("counts a report delivered after the last user prompt", () => {
+    const r = analyze([
+      user("do the work"),
+      sendTo("Jarvis", "t1"),
+      okResult("t1"),
+      assistantText("Reported. Anything else you want me to do?"),
+    ]);
+    expect(r.awaiting).toBeNull();
+  });
+
+  it("does not let an earlier report veto a question asked after the user spoke again", () => {
+    const r = analyze([
+      user("do the work"),
+      sendTo("Jarvis", "t1"),
+      okResult("t1"),
+      assistantText("Done."),
+      user("one more thing"),
+      assistantText("Which branch should I use?"),
+    ]);
+    expect(r.delivered).toBe(true);
+    expect(r.awaiting?.source).toBe("inferred");
+  });
+
+  it("does not treat a tool result or a meta message as the user speaking", () => {
+    const r = analyze([
+      user("do the work"),
+      sendTo("Jarvis", "t1"),
+      okResult("t1"),
+      { type: "user", isMeta: true, message: { content: "<system-reminder>hook output</system-reminder>" } },
+      assistantText("Reported. Want me to continue?"),
+    ]);
+    expect(r.awaiting).toBeNull();
+  });
+
+  it("is cleared once the user replies, because the session is no longer idle", () => {
+    const r = analyze([assistantText("Which option?"), user("option 2")]);
+    expect(r.idle).toBe(false);
+    expect(r.awaiting).toBeNull();
+  });
+});
+
+describe("inferAwaiting", () => {
+  const T0 = 1_700_000_000_000;
+  let transcript;
+  let reads;
+  let deps;
+  const job = () => ({ id: "j1", mode: "interactive", sessionId: "sess-1" });
+
+  beforeEach(() => {
+    transcript = { records: [assistantText("Which option do you want?")], mtimeMs: T0 };
+    reads = 0;
+    deps = {
+      supervisorName: "Jarvis",
+      locateTranscript: () => ({ path: "/t.jsonl", mtimeMs: transcript.mtimeMs }),
+      readTranscript: () => {
+        reads += 1;
+        return transcript.records.map((r) => JSON.stringify(r)).join("\n");
+      },
+    };
+  });
+
+  it("returns what the stopped session is waiting for", () => {
+    expect(inferAwaiting(job(), deps)?.source).toBe("inferred");
+  });
+
+  it("answers at once, with no quiet period, because the Stop hook already fired", () => {
+    transcript.mtimeMs = Date.now();
+    expect(inferAwaiting(job(), deps)).not.toBeNull();
+  });
+
+  it("re-reads the file only when it changes", () => {
+    const j = job();
+    inferAwaiting(j, deps);
+    inferAwaiting(j, deps);
+    inferAwaiting(j, deps);
+    expect(reads).toBe(1);
+
+    transcript.records = [...transcript.records, { type: "user", message: { content: "option 2" } }];
+    transcript.mtimeMs += 1000;
+    expect(inferAwaiting(j, deps)).toBeNull();
+    expect(reads).toBe(2);
+  });
+
+  it("is null for a job with no session id or no transcript, as before this existed", () => {
+    expect(inferAwaiting({ id: "j", mode: "interactive", sessionId: null }, deps)).toBeNull();
+    expect(inferAwaiting({ id: "j", mode: "headless", sessionId: "s" }, deps)).toBeNull();
+    deps.locateTranscript = () => null;
+    expect(inferAwaiting(job(), deps)).toBeNull();
+  });
+
+  it("is null when the transcript cannot be read", () => {
+    deps.readTranscript = () => null;
+    expect(inferAwaiting(job(), deps)).toBeNull();
   });
 });
 
@@ -419,6 +594,17 @@ describe("relayIfUndelivered", () => {
     transcript.records = idleUndelivered();
     relayIfUndelivered(makeJob({ id: "job-2" }), deps);
     expect(events).not.toContain("claim");
+  });
+
+  it("relays a session waiting on a reply when it is closed, its last chance, but not while open", () => {
+    const waiting = () => makeJob({ status: "needs_input", needsInputReason: "question" });
+    expect(relayIfUndelivered(waiting(), deps)).toBe("needs-input");
+    expect(relayIfUndelivered(waiting(), deps, { closing: true })).toBe("sent");
+  });
+
+  it("still leaves a permission dialog alone when the job is closed", () => {
+    const job = makeJob({ status: "needs_input", needsInputReason: "permission" });
+    expect(relayIfUndelivered(job, deps, { closing: true })).toBe("needs-input");
   });
 
   it("leaves a needs_input job alone", () => {
