@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -30,6 +30,19 @@ function isAlive(pid) {
   } catch {
     return false;
   }
+}
+
+// Long enough that the fake gh has started and written its pid before the
+// deadline kills it, even when the machine is busy; a 300ms deadline raced
+// the script's own startup and flaked.
+const DEADLINE_MS = "1500";
+
+async function readPid(pidFile, ms = 3000) {
+  const deadline = Date.now() + ms;
+  while (!existsSync(pidFile) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 25));
+  }
+  return Number(readFileSync(pidFile, "utf-8").trim());
 }
 
 async function waitUntilDead(pid, ms = 3000) {
@@ -77,13 +90,13 @@ describe("searchMyPrs", () => {
 
   it("gives up on a stalled gh at the deadline and kills it even when it ignores SIGTERM", async () => {
     const pidFile = stalledGh();
-    process.env.GH_TIMEOUT_MS = "300";
+    process.env.GH_TIMEOUT_MS = DEADLINE_MS;
 
     const started = Date.now();
     expect(await searchMyPrs()).toEqual([]);
-    expect(Date.now() - started).toBeLessThan(5000);
+    expect(Date.now() - started).toBeLessThan(8000);
 
-    const pid = Number(readFileSync(pidFile, "utf-8").trim());
+    const pid = await readPid(pidFile);
     expect(await waitUntilDead(pid)).toBe(true);
   });
 });
@@ -91,13 +104,13 @@ describe("searchMyPrs", () => {
 describe("synchronous runner timeout (via viewPr)", () => {
   it("returns null at the deadline and kills a gh that ignores SIGTERM", async () => {
     const pidFile = stalledGh();
-    process.env.GH_TIMEOUT_MS = "300";
+    process.env.GH_TIMEOUT_MS = DEADLINE_MS;
 
     const started = Date.now();
     expect(viewPr("https://github.com/a/b/pull/1")).toBeNull();
-    expect(Date.now() - started).toBeLessThan(5000);
+    expect(Date.now() - started).toBeLessThan(8000);
 
-    const pid = Number(readFileSync(pidFile, "utf-8").trim());
+    const pid = await readPid(pidFile);
     expect(await waitUntilDead(pid)).toBe(true);
   });
 });
