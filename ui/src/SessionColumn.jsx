@@ -8,7 +8,7 @@
 
 import { useEffect, useState } from "react";
 import { StatusIcon } from "./StatusIcon.jsx";
-import { isLiveStatus, needsInputTitle } from "./jobStatus.js";
+import { isLiveStatus, needsInputTitle, requestedByTitle } from "./jobStatus.js";
 import { openTerminal } from "./openTerminal.js";
 
 function useOpenInIterm(jobId) {
@@ -45,7 +45,7 @@ export function OpenInIterm({ jobId }) {
   );
 }
 
-function SessionCard({ job, onClose }) {
+function SessionCard({ job, jobs, onClose }) {
   const { state, error, open } = useOpenInIterm(job.id);
   const [closing, setClosing] = useState(false);
   const title = job.title || job.ticketKey || "General dispatch";
@@ -75,6 +75,11 @@ function SessionCard({ job, onClose }) {
           <StatusIcon status={job.status} />
         </span>
         <span className="session-title">{title}</span>
+        {job.requestedBy && (
+          <span className="session-requested" title={requestedByTitle(job, jobs)}>
+            requested
+          </span>
+        )}
         <span className="session-time">
           {new Date(job.startedAt).toLocaleTimeString()}
         </span>
@@ -193,7 +198,7 @@ export function SessionColumn({ jobs, onRefresh, onClose }) {
           </div>
         )}
         {jobs.map((job) => (
-          <SessionCard job={job} onClose={onClose} key={job.id} />
+          <SessionCard job={job} jobs={jobs} onClose={onClose} key={job.id} />
         ))}
       </div>
     </div>

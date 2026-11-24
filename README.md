@@ -94,7 +94,7 @@ shows as an error in the tab, not an empty list.
 
 ## Dispatch
 
-`POST /api/dispatch` with `{ prompt, context, mode, brain }` starts an
+`POST /api/dispatch` with `{ prompt, context, mode, requestedBy, brain }` starts an
 agent in its own tmux session. `context` is `{ type: "ticket", key }` or
 `{ type: "none" }`; a ticket dispatch prepends the ticket's full detail and
 runs in the repo resolved from its labels or description, falling back to
@@ -135,6 +135,23 @@ Every dispatched prompt starts with `/automodel`
 the task before starting it, and ends with an instruction to report back to
 the supervisor agent via `SendMessage` (retrying once if it is denied, then
 putting the report in the session's final output as `UNDELIVERED to <name>:`).
+
+### Agents asking for agents
+
+A dispatched interactive agent that needs another agent for real work (edits,
+commits, PRs, anything long-running) doesn't spawn one: it `SendMessage`s the
+supervisor a brief, what done looks like, and its own job id (the prompt tells
+it, and it's also its session name, `ccenter-<job id>`). The supervisor
+dispatches with `requestedBy: "<that job id>"`, then relays the new agent's
+report back to the requester, which waits idle instead of polling. Every
+working agent is therefore a tracked job, and the supervisor stays the one
+place sessions start. A quick read-only helper (an Explore search) is not
+covered.
+
+`requestedBy` is stored on the job (and shown as a "requested" badge on its
+card). The API refuses it (400) unless it names a running interactive job that
+was not itself requested, and a requester can have at most 3 running requested
+agents. Requested agents get no ask-for-an-agent instruction themselves.
 
 ### Report relay
 
@@ -184,7 +201,7 @@ lives in one skill per capability, in `commands/`, loaded only when needed:
 | `/cc-prs` | Supervisor agent | Listing open PRs and review requests; posting one to Slack |
 | `/cc-memory` | Supervisor agent | Searching and saving its memory |
 | `/cc-brain-view` | Dispatched agents | Using the Brain View canvas |
-| `/cc-report` | Dispatched agents | Reporting back to the supervisor agent when done |
+| `/cc-report` | Dispatched agents | Reporting back to the supervisor agent when done; asking it for another agent |
 
 The supervisor's briefing and each dispatched prompt carry a pointer to the
 right skills, plus the few rules that must hold even if a skill never loads.

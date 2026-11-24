@@ -700,7 +700,8 @@ body {
   letter-spacing: 0.03em;
 }
 
-.session-idle {
+.session-idle,
+.session-requested {
   flex-shrink: 0;
   padding: 1px 6px;
   border-radius: 3px;

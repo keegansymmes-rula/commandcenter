@@ -9,6 +9,16 @@ export function isLiveStatus(status) {
   return LIVE_STATUSES.includes(status);
 }
 
+// Hover text for a job another agent asked the supervisor to start. The
+// requester may already be closed and gone from the list, so fall back to its
+// id rather than dropping the link.
+export function requestedByTitle(job, jobs) {
+  if (!job.requestedBy) return null;
+  const requester = jobs.find((j) => j.id === job.requestedBy);
+  const name = requester?.title || requester?.ticketKey || job.requestedBy;
+  return `Requested by another agent: ${name}`;
+}
+
 // What a needs_input badge says on hover. The reason comes from the API
 // (needsInputReason); a job from an older API has none, so it gets the generic
 // wording. The note is the agent's own words and is only ever rendered as text.
