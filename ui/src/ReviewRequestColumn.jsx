@@ -15,7 +15,9 @@ export function ReviewRequestColumn() {
 
   const fetchPrs = useCallback(async () => {
     try {
-      const data = await fetchPanel("/api/review-requests");
+      // Longer than the API's own 30s gh deadline, so a slow GitHub answers
+      // (ok:false, with the reason) instead of being cut off here first.
+      const data = await fetchPanel("/api/review-requests", 35_000);
       if (!data.ok) {
         setError(data.error);
         return;

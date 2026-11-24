@@ -7,6 +7,8 @@
 // Every panel added since that server started then 404s. "API error: 404" sends
 // you looking for a missing route; the real fix is restarting the server.
 
+import { pollFetch } from "./pollFetch.js";
+
 export function panelErrorMessage(status, endpoint) {
   if (status === 404) {
     return `${endpoint} returned 404 — the API server is likely older than this UI. Restart it (npm run dev:api); if it won't start, an old server still holds the port.`;
@@ -14,9 +16,11 @@ export function panelErrorMessage(status, endpoint) {
   return `API error: ${status}`;
 }
 
-// Throws on a non-2xx so callers keep their existing try/catch shape.
-export async function fetchPanel(endpoint) {
-  const res = await fetch(endpoint);
+// Throws on a non-2xx so callers keep their existing try/catch shape. Polled
+// panels pass timeoutMs so a stalled request frees its browser connection
+// slot (see pollFetch); one-off loads leave it off and wait as before.
+export async function fetchPanel(endpoint, timeoutMs) {
+  const res = timeoutMs ? await pollFetch(endpoint, timeoutMs) : await fetch(endpoint);
   if (!res.ok) throw new Error(panelErrorMessage(res.status, endpoint));
   return res.json();
 }
