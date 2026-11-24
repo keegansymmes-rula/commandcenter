@@ -140,8 +140,11 @@ putting the report in the session's final output as `UNDELIVERED to <name>:`).
 
 A dispatched interactive agent that needs another agent for real work (edits,
 commits, PRs, anything long-running) doesn't spawn one: it `SendMessage`s the
-supervisor a brief, what done looks like, and its own job id (the prompt tells
-it, and it's also its session name, `ccenter-<job id>`). The supervisor
+supervisor a message starting `[agent-request]` with a brief, what done looks
+like, and its own job id (the prompt tells it, and it's also its session name,
+`ccenter-<job id>`). The marker keeps the request from counting as the agent's
+completion report: a requester waiting on a result is not relayed as
+unreported, and if its own report later fails to send, it still is. The supervisor
 dispatches with `requestedBy: "<that job id>"`, then relays the new agent's
 report back to the requester, which waits idle instead of polling. Every
 working agent is therefore a tracked job, and the supervisor stays the one

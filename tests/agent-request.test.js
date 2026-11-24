@@ -5,7 +5,7 @@ import {
   agentSessionName,
   checkRequestedBy,
 } from "../api/lib/agent-request.js";
-import { NEEDS_INPUT_MARKER } from "../api/lib/report-relay.js";
+import { AGENT_REQUEST_MARKER, NEEDS_INPUT_MARKER } from "../api/lib/report-relay.js";
 
 const LIVE = new Set(["running", "needs_input", "idle", "connection_error"]);
 const isLive = (status) => LIVE.has(status);
@@ -31,6 +31,10 @@ describe("agentRequestInstruction", () => {
     expect(text).toContain("send Jarvis a SendMessage");
     expect(text).toContain("job id job-42");
     expect(text).toContain("what done looks like");
+  });
+
+  it("tells the agent exactly the marker the relay detector looks for", () => {
+    expect(text).toContain(`starts with \`${AGENT_REQUEST_MARKER}\``);
   });
 
   it("asks for real work only, leaving quick read-only helpers alone", () => {

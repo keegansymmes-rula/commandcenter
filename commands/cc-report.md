@@ -67,7 +67,8 @@ job on the dashboard. A quick read-only helper, such as an Explore search,
 you can still run yourself.
 
 Send the supervisor one `SendMessage` (same name and retry rule as a report)
-with three things:
+that starts with `[agent-request]`, so it isn't mistaken for your completion
+report, and carries three things:
 
 1. The brief: what to do and why, written for a colleague who has seen none
    of your context. Name the repo, and the branch or PR it builds on.
@@ -83,7 +84,7 @@ waiting on another session, not on the user, so your job should show `idle`.
 
 Example:
 
-> Requesting an agent. Brief: in ~/dev/api, fix the flaky retry test in
+> [agent-request] Brief: in ~/dev/api, fix the flaky retry test in
 > tests/retry.test.js on a new worktree off origin/main and open a draft PR.
 > Done: the test passes 20 runs in a row and the PR URL is in the report.
 > My job id: 3f9c…

@@ -533,12 +533,6 @@ app.post("/api/dispatch", async (request, reply) => {
     reply.code(400);
     return { ok: false, error: 'mode must be "headless" or "interactive"' };
   }
-  const requestError = checkRequestedBy(requestedBy, listJobs(), isLive);
-  if (requestError) {
-    reply.code(400);
-    return { ok: false, error: requestError };
-  }
-
   const type = context?.type || "none";
   let cwd = DEV_ROOT;
   let ticketKey = null;
@@ -658,6 +652,17 @@ app.post("/api/dispatch", async (request, reply) => {
         jobId: existing.id,
       };
     }
+  }
+
+  // Checked here, not up with the other body validation: the ticket lookups
+  // above are awaited, so a check made before them can pass for several
+  // dispatches at once (or for a requester closed in the meantime) and let the
+  // per-requester cap be exceeded. Nothing below awaits before startCommandJob
+  // registers the job, so this view of the jobs is still true when it does.
+  const requestError = checkRequestedBy(requestedBy, listJobs(), isLive);
+  if (requestError) {
+    reply.code(400);
+    return { ok: false, error: requestError };
   }
 
   // Every dispatched agent gets a brain dir and permission to write to it —

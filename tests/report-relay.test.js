@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  AGENT_REQUEST_MARKER,
   analyzeTranscript,
   boundText,
   buildRelayMessage,
@@ -114,6 +115,84 @@ describe("analyzeTranscript: was a report delivered", () => {
     const sub = { ...sendTo("Jarvis", "t1"), isSidechain: true };
     const subResult = { ...okResult("t1"), isSidechain: true };
     expect(analyze([sub, subResult, assistantText("Done.")]).delivered).toBe(false);
+  });
+});
+
+const requestTo = (to, toolId) =>
+  assistantTool("SendMessage", { to, message: `${AGENT_REQUEST_MARKER} Brief: fix the test. My job id: j1` }, toolId);
+const relayedResult = () => ({
+  type: "user",
+  message: { content: [{ type: "text", text: "Jarvis relays: the other agent opened PR #5." }] },
+});
+
+describe("analyzeTranscript: asking the supervisor for an agent", () => {
+  it("does not count a request as the completion report", () => {
+    const r = analyze([requestTo("Jarvis", "t1"), okResult("t1"), assistantText("Waiting on the new agent.")]);
+    expect(r.delivered).toBe(false);
+  });
+
+  it("reads an idle session with an answered-by-nobody request as waiting on another agent", () => {
+    const r = analyze([requestTo("Jarvis", "t1"), okResult("t1"), assistantText("Waiting on the new agent.")]);
+    expect(r.idle).toBe(true);
+    expect(r.waitingOnAgent).toBe(true);
+  });
+
+  it("is not waiting when the request itself was denied", () => {
+    const r = analyze([requestTo("Jarvis", "t1"), denied("t1"), assistantText("Could not ask.")]);
+    expect(r.waitingOnAgent).toBe(false);
+  });
+
+  it("stops waiting once the relayed result arrives as a new prompt", () => {
+    const r = analyze([
+      requestTo("Jarvis", "t1"),
+      okResult("t1"),
+      assistantText("Waiting on the new agent."),
+      relayedResult(),
+      assistantText("The other agent finished; carrying on."),
+    ]);
+    expect(r.waitingOnAgent).toBe(false);
+  });
+
+  it("stops waiting once the session reports, and then counts the report", () => {
+    const r = analyze([
+      requestTo("Jarvis", "t1"),
+      okResult("t1"),
+      relayedResult(),
+      sendTo("Jarvis", "t2"),
+      okResult("t2"),
+      assistantText("Done."),
+    ]);
+    expect(r.waitingOnAgent).toBe(false);
+    expect(r.delivered).toBe(true);
+  });
+
+  it("only treats a message that starts with the marker as a request", () => {
+    const mentions = assistantTool(
+      "SendMessage",
+      { to: "Jarvis", message: `Done. I did not need to send ${AGENT_REQUEST_MARKER} this time.` },
+      "t1",
+    );
+    const r = analyze([mentions, okResult("t1"), assistantText("Done.")]);
+    expect(r.delivered).toBe(true);
+    expect(r.waitingOnAgent).toBe(false);
+  });
+
+  it("does not read a wait that ends in a question as waiting on the user", () => {
+    const r = analyze([
+      requestTo("Jarvis", "t1"),
+      okResult("t1"),
+      assistantText("Waiting on the other agent. Anything else meanwhile?"),
+    ]);
+    expect(r.awaiting).toBeNull();
+  });
+
+  it("still honours a [needs-input] marker on the wait", () => {
+    const r = analyze([
+      requestTo("Jarvis", "t1"),
+      okResult("t1"),
+      assistantText(`Waiting.\n${NEEDS_INPUT_MARKER} need a login`),
+    ]);
+    expect(r.awaiting?.source).toBe("marker");
   });
 });
 
@@ -529,6 +608,49 @@ describe("relayIfUndelivered", () => {
     const job = makeJob();
     for (let i = 0; i < 5; i++) relayIfUndelivered(job, deps);
     expect(delivered).toHaveLength(1);
+  });
+
+  describe("a session waiting on an agent it asked the supervisor for", () => {
+    const waiting = () => [
+      requestTo("Jarvis", "t1"),
+      okResult("t1"),
+      assistantText("Waiting on the new agent."),
+    ];
+
+    it("is neither relayed nor settled while it waits", () => {
+      transcript.records = waiting();
+      const job = makeJob();
+      expect(relayIfUndelivered(job, deps)).toBe("waiting-on-agent");
+      expect(delivered).toHaveLength(0);
+      expect(job.relay).toBeNull();
+    });
+
+    it("is still relayed when its completion report then fails to send", () => {
+      const job = makeJob();
+      transcript.records = waiting();
+      relayIfUndelivered(job, deps);
+
+      transcript.records = [
+        ...waiting(),
+        relayedResult(),
+        sendTo("Jarvis", "t2"),
+        denied("t2"),
+        sendTo("Jarvis", "t3"),
+        denied("t3"),
+        assistantText("UNDELIVERED to Jarvis: PR #5 merged."),
+      ];
+      // A later write, long enough ago that the session has settled again.
+      transcript.mtimeMs = T0 - 59_000;
+      now = T0 + 60_000;
+      expect(relayIfUndelivered(job, deps)).toBe("sent");
+      expect(delivered[0]).toContain("UNDELIVERED to Jarvis: PR #5 merged.");
+    });
+
+    it("is relayed when it is closed while still waiting, the last chance", () => {
+      transcript.records = waiting();
+      expect(relayIfUndelivered(makeJob(), deps, { closing: true })).toBe("sent");
+      expect(delivered).toHaveLength(1);
+    });
   });
 
   it("is exactly once across an API restart, using the persisted state", () => {
