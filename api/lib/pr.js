@@ -7,8 +7,14 @@ const execFileAsync = promisify(execFile);
 // An unbounded gh call hung for hours after a network stall and, under
 // execSync, froze the whole API (every route queued behind it, so the board
 // never left "Loading"). Bound every call; SIGKILL because gh can ignore TERM
-// while stuck on a socket.
-const GH_TIMEOUT_MS = 30_000;
+// while stuck on a socket. GH_TIMEOUT_MS overrides the default so tests can
+// exercise the deadline without waiting 30s; read per call, not at import.
+const DEFAULT_GH_TIMEOUT_MS = 30_000;
+
+function ghTimeoutMs() {
+  const override = Number(process.env.GH_TIMEOUT_MS);
+  return override > 0 ? override : DEFAULT_GH_TIMEOUT_MS;
+}
 
 function run(cmd, cwd) {
   try {
@@ -16,7 +22,7 @@ function run(cmd, cwd) {
       cwd,
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
-      timeout: GH_TIMEOUT_MS,
+      timeout: ghTimeoutMs(),
       killSignal: "SIGKILL",
     }).trim();
   } catch {
@@ -107,7 +113,7 @@ export async function searchMyPrs({ role = "author", state = "open", limit = 30 
         "--limit",
         String(limit),
       ],
-      { encoding: "utf-8", timeout: GH_TIMEOUT_MS, killSignal: "SIGKILL" },
+      { encoding: "utf-8", timeout: ghTimeoutMs(), killSignal: "SIGKILL" },
     );
     return JSON.parse(stdout.trim());
   } catch {
