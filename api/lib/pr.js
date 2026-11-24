@@ -121,6 +121,74 @@ export async function searchMyPrs({ role = "author", state = "open", limit = 30 
   }
 }
 
+// Unlike run(), a failure here must reach the caller: "gh isn't logged in"
+// rendered as an empty review queue would read as "nothing to review".
+// Async, because the dashboard polls this every minute and a slow search must
+// not stall the API's other routes (session updates, dispatch) for its duration.
+// Shares ghTimeoutMs()/SIGKILL with the other gh callers: a second deadline
+// here would be one more place for a stalled gh to outlive its timeout.
+function runStrict(args) {
+  return new Promise((resolve, reject) => {
+    execFile(
+      "gh",
+      args,
+      { encoding: "utf-8", timeout: ghTimeoutMs(), killSignal: "SIGKILL" },
+      (err, stdout, stderr) => {
+        if (err) {
+          const detail = String(stderr || err.message || "").trim();
+          reject(new Error(`gh search failed: ${detail || "unknown error"}`));
+          return;
+        }
+        resolve(String(stdout).trim());
+      },
+    );
+  });
+}
+
+// Open PRs where GitHub is asking *you* for review, across every repo.
+// `user-review-requested:@me` matches only a request addressed to your own
+// account. `review-requested:@me` (and `gh search prs --review-requested=@me`,
+// which sends it) also matches a request made to a team you belong to — a
+// whole-team ping nobody personally owes a review on. GitHub silently ignores
+// a qualifier it doesn't know, so a typo here would return unrelated PRs
+// rather than fail; tests/pr.test.js pins the exact qualifier.
+//
+// Sorted by GitHub, not afterwards: the default is best-match, so with more
+// than `limit` requests the cut would drop the newest ones and re-sorting the
+// survivors couldn't bring them back.
+export async function searchReviewRequestedPrs({ state = "open", limit = 50 } = {}) {
+  const result = await runStrict([
+    "search",
+    "prs",
+    "user-review-requested:@me",
+    `--state=${state}`,
+    "--sort=updated",
+    "--order=desc",
+    "--json",
+    "repository,number,title,url,isDraft,updatedAt,author",
+    `--limit=${limit}`,
+  ]);
+  return result ? JSON.parse(result) : [];
+}
+
+// Same card fields as /api/prs, plus the author (the roles chips don't apply:
+// every row here is a review request). Order is whatever GitHub returned.
+export function shapeReviewRequests(rawPrs) {
+  return rawPrs.map((pr) => ({
+    repo: pr.repository?.nameWithOwner || null,
+    number: pr.number,
+    title: pr.title,
+    url: pr.url,
+    isDraft: Boolean(pr.isDraft),
+    updatedAt: pr.updatedAt,
+    author: pr.author?.login || null,
+  }));
+}
+
+export async function listReviewRequests() {
+  return shapeReviewRequests(await searchReviewRequestedPrs());
+}
+
 const PR_URL = /^https:\/\/github\.com\/([\w.-]+\/[\w.-]+)\/pull\/\d+$/;
 
 export function isPrUrl(url) {

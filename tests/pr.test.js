@@ -1,118 +1,15 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { isPrUrl, searchMyPrs, viewPr } from "../api/lib/pr.js";
+import { execFile } from "node:child_process";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import {
+  isPrUrl,
+  listReviewRequests,
+  searchReviewRequestedPrs,
+  shapeReviewRequests,
+} from "../api/lib/pr.js";
 
-const originalPath = process.env.PATH;
-let dir = null;
-
-function fakeGh(script) {
-  if (dir) rmSync(dir, { recursive: true, force: true });
-  dir = mkdtempSync(join(tmpdir(), "fake-gh-"));
-  const bin = join(dir, "gh");
-  writeFileSync(bin, `#!/bin/sh\n${script}\n`);
-  chmodSync(bin, 0o755);
-  process.env.PATH = `${dir}:${originalPath}`;
-}
-
-// Records its pid, ignores SIGTERM, then stalls. exec keeps both the pid and
-// the ignored disposition, so only SIGKILL ends it.
-function stalledGh() {
-  fakeGh(`echo $$ > "$(dirname "$0")/pid"\ntrap '' TERM\nexec sleep 30`);
-  return join(dir, "pid");
-}
-
-function isAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-// Long enough that the fake gh has started and written its pid before the
-// deadline kills it, even when the machine is busy; a 300ms deadline raced
-// the script's own startup and flaked.
-const DEADLINE_MS = "1500";
-
-async function readPid(pidFile, ms = 3000) {
-  const deadline = Date.now() + ms;
-  while (!existsSync(pidFile) && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 25));
-  }
-  return Number(readFileSync(pidFile, "utf-8").trim());
-}
-
-async function waitUntilDead(pid, ms = 3000) {
-  const deadline = Date.now() + ms;
-  while (isAlive(pid) && Date.now() < deadline) {
-    await new Promise((r) => setTimeout(r, 25));
-  }
-  return !isAlive(pid);
-}
-
-afterEach(() => {
-  process.env.PATH = originalPath;
-  delete process.env.GH_TIMEOUT_MS;
-  if (dir) rmSync(dir, { recursive: true, force: true });
-  dir = null;
-});
-
-describe("searchMyPrs", () => {
-  it("parses gh's JSON output", async () => {
-    fakeGh(`echo '[{"number":7,"url":"https://github.com/a/b/pull/7"}]'`);
-    expect(await searchMyPrs()).toEqual([
-      { number: 7, url: "https://github.com/a/b/pull/7" },
-    ]);
-  });
-
-  it("returns [] when gh fails or prints junk", async () => {
-    fakeGh("exit 1");
-    expect(await searchMyPrs()).toEqual([]);
-    fakeGh("echo not-json");
-    expect(await searchMyPrs()).toEqual([]);
-  });
-
-  it("does not block the event loop while gh is slow", async () => {
-    fakeGh("sleep 1; echo '[]'");
-    const pending = searchMyPrs();
-    // A synchronous exec would hold the loop for the full second, so this
-    // timer could not fire before the search settled.
-    const winner = await Promise.race([
-      new Promise((r) => setTimeout(() => r("timer"), 100)),
-      pending.then(() => "search"),
-    ]);
-    expect(winner).toBe("timer");
-    await pending;
-  });
-
-  it("gives up on a stalled gh at the deadline and kills it even when it ignores SIGTERM", async () => {
-    const pidFile = stalledGh();
-    process.env.GH_TIMEOUT_MS = DEADLINE_MS;
-
-    const started = Date.now();
-    expect(await searchMyPrs()).toEqual([]);
-    expect(Date.now() - started).toBeLessThan(8000);
-
-    const pid = await readPid(pidFile);
-    expect(await waitUntilDead(pid)).toBe(true);
-  });
-});
-
-describe("synchronous runner timeout (via viewPr)", () => {
-  it("returns null at the deadline and kills a gh that ignores SIGTERM", async () => {
-    const pidFile = stalledGh();
-    process.env.GH_TIMEOUT_MS = DEADLINE_MS;
-
-    const started = Date.now();
-    expect(viewPr("https://github.com/a/b/pull/1")).toBeNull();
-    expect(Date.now() - started).toBeLessThan(8000);
-
-    const pid = await readPid(pidFile);
-    expect(await waitUntilDead(pid)).toBe(true);
-  });
+vi.mock("node:child_process", async (importOriginal) => {
+  const actual = await importOriginal();
+  return { ...actual, execFile: vi.fn() };
 });
 
 describe("isPrUrl", () => {
@@ -134,5 +31,136 @@ describe("isPrUrl", () => {
   it("rejects non-strings", () => {
     expect(isPrUrl(undefined)).toBe(false);
     expect(isPrUrl({ url: "https://github.com/a/b/pull/1" })).toBe(false);
+  });
+});
+
+// execFile's real signature: (file, args, options, callback(err, stdout, stderr)).
+function ghReturns(stdout) {
+  execFile.mockImplementation((_file, _args, _opts, cb) => cb(null, stdout, ""));
+}
+function ghFails(message, stderr) {
+  execFile.mockImplementation((_file, _args, _opts, cb) =>
+    cb(Object.assign(new Error(message), { code: 4 }), "", stderr),
+  );
+}
+
+describe("searchReviewRequestedPrs", () => {
+  // Braces matter: Vitest runs a function returned from beforeEach as teardown.
+  beforeEach(() => {
+    execFile.mockReset();
+  });
+
+  it("asks GitHub for requests addressed to you, not to a team you are on", async () => {
+    ghReturns("[]");
+    await searchReviewRequestedPrs();
+    const [bin, args] = execFile.mock.calls[0];
+    expect(bin).toBe("gh");
+    expect(args).toContain("user-review-requested:@me");
+    // review-requested:@me would also match team requests; GitHub ignores an
+    // unknown qualifier instead of erroring, so a slip here fails silently.
+    expect(args.join(" ")).not.toMatch(/(^|[^-])review-requested/);
+    expect(args).toContain("--state=open");
+  });
+
+  it("has GitHub sort newest-updated first, so the limit cuts the oldest", async () => {
+    ghReturns("[]");
+    await searchReviewRequestedPrs();
+    const args = execFile.mock.calls[0][1];
+    expect(args).toContain("--sort=updated");
+    expect(args).toContain("--order=desc");
+  });
+
+  it("bounds the call with a timeout", async () => {
+    ghReturns("[]");
+    await searchReviewRequestedPrs();
+    const opts = execFile.mock.calls[0][2];
+    expect(opts.timeout).toBeGreaterThan(0);
+    // gh can ignore SIGTERM while stuck on a socket; only SIGKILL guarantees
+    // the deadline holds.
+    expect(opts.killSignal).toBe("SIGKILL");
+  });
+
+  it("returns the parsed list", async () => {
+    ghReturns('[{"number":7}]');
+    await expect(searchReviewRequestedPrs()).resolves.toEqual([{ number: 7 }]);
+  });
+
+  it("treats empty output as no requests", async () => {
+    ghReturns("");
+    await expect(searchReviewRequestedPrs()).resolves.toEqual([]);
+  });
+
+  it("surfaces a gh failure instead of reporting an empty queue", async () => {
+    ghFails("exit 4", "gh: To use GitHub CLI, run: gh auth login");
+    await expect(searchReviewRequestedPrs()).rejects.toThrow(/gh auth login/);
+  });
+
+  it("falls back to the error message when gh wrote nothing to stderr", async () => {
+    ghFails("spawn gh ENOENT", "");
+    await expect(searchReviewRequestedPrs()).rejects.toThrow(/ENOENT/);
+  });
+});
+
+describe("shapeReviewRequests", () => {
+  const raw = (over) => ({
+    repository: { nameWithOwner: "org/repo" },
+    number: 1,
+    title: "A change",
+    url: "https://github.com/org/repo/pull/1",
+    isDraft: false,
+    updatedAt: "2026-11-10T00:00:00Z",
+    author: { login: "ada" },
+    ...over,
+  });
+
+  it("maps the card fields, including the author", () => {
+    expect(shapeReviewRequests([raw()])).toEqual([
+      {
+        repo: "org/repo",
+        number: 1,
+        title: "A change",
+        url: "https://github.com/org/repo/pull/1",
+        isDraft: false,
+        updatedAt: "2026-11-10T00:00:00Z",
+        author: "ada",
+      },
+    ]);
+  });
+
+  it("keeps GitHub's order", () => {
+    const input = [raw({ number: 2 }), raw({ number: 1 }), raw({ number: 3 })];
+    expect(shapeReviewRequests(input).map((p) => p.number)).toEqual([2, 1, 3]);
+  });
+
+  it("tolerates a missing repository or author (deleted account, ghost user)", () => {
+    const [pr] = shapeReviewRequests([raw({ repository: undefined, author: null })]);
+    expect(pr.repo).toBeNull();
+    expect(pr.author).toBeNull();
+  });
+
+  it("keeps drafts, flagged", () => {
+    expect(shapeReviewRequests([raw({ isDraft: true })])[0].isDraft).toBe(true);
+  });
+});
+
+describe("listReviewRequests", () => {
+  beforeEach(() => {
+    execFile.mockReset();
+  });
+
+  it("is the search shaped for the /api/review-requests route", async () => {
+    ghReturns(
+      JSON.stringify([
+        { repository: { nameWithOwner: "o/r" }, number: 9, title: "t", url: "u", isDraft: false, updatedAt: "2026-11-01", author: { login: "bo" } },
+      ]),
+    );
+    await expect(listReviewRequests()).resolves.toEqual([
+      { repo: "o/r", number: 9, title: "t", url: "u", isDraft: false, updatedAt: "2026-11-01", author: "bo" },
+    ]);
+  });
+
+  it("rejects when gh fails, for the route to report as ok:false", async () => {
+    ghFails("exit 1", "boom");
+    await expect(listReviewRequests()).rejects.toThrow(/boom/);
   });
 });

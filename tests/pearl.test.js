@@ -3,10 +3,25 @@ import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { __test__, readSoul, refreshPearl, writeSoul } from "../api/pearl.js";
 import { findMemoryBin } from "../api/lib/pearl-memory.js";
 import { NOTICE_TAG } from "../api/lib/pearl-session.js";
+
+// pearl-session.js reads PEARL_NAME once, at import, and the static imports
+// above are evaluated before any test body runs. vi.hoisted runs ahead of
+// them, so the name these tests assert on is pinned here rather than
+// inherited from whoever's shell runs `npm test` (a Jarvis session, say).
+const AMBIENT_PEARL_NAME = vi.hoisted(() => {
+  const ambient = process.env.PEARL_NAME;
+  process.env.PEARL_NAME = "Pearl";
+  return ambient;
+});
+
+afterAll(() => {
+  if (AMBIENT_PEARL_NAME === undefined) delete process.env.PEARL_NAME;
+  else process.env.PEARL_NAME = AMBIENT_PEARL_NAME;
+});
 
 vi.mock("node:child_process", async (importOriginal) => {
   const actual = await importOriginal();

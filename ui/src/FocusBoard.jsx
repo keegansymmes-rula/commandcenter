@@ -4,21 +4,24 @@
 // is for general, ticket-less instructions. Replaces the old all-stacks
 // ops-monitoring layout.
 //
-// Tickets/Todos/PRs are tabs in one pane rather than three side-by-side
-// columns — four-plus equal-width columns stopped working once PRs joined
-// Tickets/Todos/Sessions: everything got too narrow to read (titles
+// Tickets/Todos/PRs/Review Requests are tabs in one pane rather than
+// side-by-side columns — four-plus equal-width columns stopped working once
+// PRs joined Tickets/Todos/Sessions: everything got too narrow to read (titles
 // truncated hard) while still stretching to full viewport height despite
 // short lists. Sessions+Dispatch stay as their own persistent pane —
 // that's the thing you watch while working, not something to tab away from.
-// All three tab contents stay mounted (just hidden) so switching is instant
+// All tab contents stay mounted (just hidden) so switching is instant
 // and each one's own polling isn't restarted by a tab switch.
 
 import { useState, useEffect, useCallback, useMemo } from "react";
 import { latestOnly } from "./latestOnly.js";
 import { isLiveStatus } from "./jobStatus.js";
+import { openTerminal } from "./openTerminal.js";
 import { TicketColumn } from "./TicketColumn.jsx";
 import { TodoColumn } from "./TodoColumn.jsx";
 import { PrColumn } from "./PrColumn.jsx";
+import { ReviewRequestColumn } from "./ReviewRequestColumn.jsx";
+import { focusTabs } from "./focusTabs.js";
 import { SessionColumn } from "./SessionColumn.jsx";
 import { DispatchBar } from "./DispatchBar.jsx";
 import { DispatchModeDialog } from "./DispatchModeDialog.jsx";
@@ -121,7 +124,9 @@ export function FocusBoard() {
         // terminal immediately instead of leaving the human to go find
         // the row and click iTerm themselves right after asking for it.
         if (mode === "interactive" && data.job?.id) {
-          fetch(`/api/jobs/${data.job.id}/open-terminal`, { method: "POST" });
+          openTerminal(data.job.id).then((result) => {
+            if (!result.ok) setDispatchError(`Couldn't open the terminal: ${result.error}`);
+          });
         }
         return true;
       } catch (err) {
@@ -234,12 +239,7 @@ export function FocusBoard() {
   if (loading) return <div className="loading">Loading focus board...</div>;
   if (error) return <div className="error">Error: {error}</div>;
 
-  const tabs = [
-    { id: "tickets", label: "Tickets" },
-    { id: "todos", label: "Todos" },
-    { id: "prs", label: "Pull Requests" },
-    { id: "pearl", label: pearlName },
-  ];
+  const tabs = focusTabs(pearlName);
 
   return (
     <div className="focus-board">
@@ -283,6 +283,9 @@ export function FocusBoard() {
             </div>
             <div className={`focus-tab-panel${activeTab === "prs" ? "" : " focus-tab-panel--hidden"}`}>
               <PrColumn />
+            </div>
+            <div className={`focus-tab-panel${activeTab === "reviews" ? "" : " focus-tab-panel--hidden"}`}>
+              <ReviewRequestColumn />
             </div>
             <div className={`focus-tab-panel${activeTab === "pearl" ? "" : " focus-tab-panel--hidden"}`}>
               <PearlConfigColumn name={pearlName} />
