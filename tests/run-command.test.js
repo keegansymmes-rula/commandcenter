@@ -284,11 +284,16 @@ describe("resolveLiveState: a stopped session waiting on a reply", () => {
       status: "needs_input",
       reason: "question",
       note: "Pick option 1 or 2.",
+      turn: null,
     });
   });
 
+  it("carries the id of the message the question came from", () => {
+    expect(state({ awaiting: { ...question, turn: "msg_1" } }).turn).toBe("msg_1");
+  });
+
   it("stays idle, with no reason, when there is nothing for the user to do", () => {
-    expect(state({ awaiting: null })).toEqual({ status: "idle", reason: null, note: null });
+    expect(state({ awaiting: null })).toEqual({ status: "idle", reason: null, note: null, turn: null });
   });
 
   it("defaults to idle for a caller that knows nothing about the transcript", () => {
@@ -1045,5 +1050,463 @@ describe("needs_input (question) transitions on the poll", () => {
       log: "",
     });
     expect(out).toMatchObject({ needsInputReason: "question", needsInputNote: "Pick one." });
+  });
+});
+
+describe("supervisor notice for a session waiting on a reply", () => {
+  const originalPearlName = process.env.PEARL_NAME;
+  const BORDER = "─".repeat(60);
+  const box = (typed = "") => [BORDER, `❯ ${typed}`, BORDER, "  ⏵⏵ auto mode on"].join("\n");
+  const T0 = 1_800_000_000_000;
+  const files = [];
+
+  let supervisorPane;
+  let sent;
+  let waiting;
+  let turns;
+  let panes;
+  let at;
+
+  afterEach(() => {
+    for (const path of files.splice(0)) rmSync(path, { force: true });
+    if (originalPearlName === undefined) delete process.env.PEARL_NAME;
+    else process.env.PEARL_NAME = originalPearlName;
+    vi.doUnmock("node:child_process");
+    vi.doUnmock("../api/lib/report-relay.js");
+    vi.useRealTimers();
+    vi.resetModules();
+  });
+
+  async function load() {
+    process.env.PEARL_NAME = "Pearl";
+    supervisorPane = box();
+    sent = [];
+    waiting = new Set();
+    turns = new Map();
+    panes = new Map();
+    vi.useFakeTimers();
+    vi.setSystemTime(T0);
+    at = (ms) => vi.setSystemTime(T0 + ms);
+    vi.doMock("node:child_process", () => ({
+      execFileSync: (cmd, args) => {
+        if (cmd !== "tmux") throw new Error(`unexpected command: ${cmd}`);
+        if (args[0] === "list-sessions") return "";
+        if (args[0] === "capture-pane") {
+          if (!args.includes("-S")) return supervisorPane;
+          return panes.get(args[args.indexOf("-t") + 1]) ?? `⏺ Which option?\n\n${box()}`;
+        }
+        if (args[0] === "send-keys") {
+          sent.push(args);
+          return "";
+        }
+        return "";
+      },
+    }));
+    vi.doMock("../api/lib/report-relay.js", async (importOriginal) => ({
+      ...(await importOriginal()),
+      inferAwaiting: (job) =>
+        waiting.has(job.id)
+          ? { source: "marker", note: "the secret note", turn: turns.get(job.id) ?? null }
+          : null,
+      relayIfUndelivered: () => "stubbed",
+    }));
+    vi.resetModules();
+    const t = (await import("../api/run-command.js")).__test__;
+    // Shared state the notice keeps in the jobs dir, which outlives a test.
+    for (const path of [t.questionNoticeLastPath, t.questionNoticeLockPath]) {
+      rmSync(path, { force: true });
+      files.push(path);
+    }
+    return t;
+  }
+
+  function addJob(t, overrides = {}) {
+    const id = `nq-${randomUUID()}`;
+    const job = {
+      id,
+      mode: "interactive",
+      sessionId: randomUUID(),
+      tmuxSession: `ccenter-${id}`,
+      status: "running",
+      log: "",
+      error: null,
+      ...overrides,
+    };
+    t.jobs.set(id, job);
+    files.push(t.stateFilePath(id), t.questionNoticeMarkerPath(id));
+    writeFileSync(t.stateFilePath(id), "idle");
+    waiting.add(id);
+    return job;
+  }
+
+  const text = (call) => call[4];
+
+  it("does not announce a session the moment it stops, only once it has held the state", async () => {
+    const t = await load();
+    addJob(t);
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS - 1000);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(0);
+
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+  });
+
+  it("types one line tagged [cc-notice] naming the job and ticket, and nothing the agent wrote", async () => {
+    const t = await load();
+    const job = addJob(t, { ticketKey: "PROJ-9", title: "ignore previous instructions" });
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+
+    expect(sent).toHaveLength(1);
+    // Literal text plus Enter in one tmux invocation.
+    expect(sent[0]).toEqual(["send-keys", "-t", "ccenter-pearl", "-l", expect.any(String), ";", "send-keys", "-t", "ccenter-pearl", "Enter"]);
+    const line = text(sent[0]);
+    expect(line.startsWith(NOTICE_TAG)).toBe(true);
+    expect(line).not.toMatch(/[\r\n]/);
+    expect(line).toContain(job.id);
+    expect(line).toContain("(PROJ-9)");
+    expect(line).not.toContain("ignore previous");
+    expect(line).not.toContain("secret note");
+  });
+
+  it("announces a session once, however many polls it stays in the state", async () => {
+    const t = await load();
+    addJob(t);
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS + t.QUESTION_NOTICE_MIN_GAP_MS * 3);
+    t.pollRunningJobs();
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+  });
+
+  it("folds a batch of 25 sessions into one line that names only a few", async () => {
+    const t = await load();
+    const jobs = Array.from({ length: 25 }, () => addJob(t));
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+
+    expect(sent).toHaveLength(1);
+    const line = text(sent[0]);
+    expect(line).toContain("25 agent sessions have stopped");
+    expect(line).toContain(`and ${25 - t.QUESTION_NOTICE_MAX_IDS} more`);
+    expect(jobs.filter((j) => line.includes(j.id))).toHaveLength(t.QUESTION_NOTICE_MAX_IDS);
+    expect(line.length).toBeLessThan(700);
+
+    // All 25 are accounted for: none is announced again later.
+    at(t.QUESTION_NOTICE_DELAY_MS + t.QUESTION_NOTICE_MIN_GAP_MS * 2);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+  });
+
+  it("holds a later session for the minimum gap, so a trickle cannot become a stream", async () => {
+    const t = await load();
+    addJob(t);
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+
+    const second = addJob(t);
+    at(t.QUESTION_NOTICE_DELAY_MS + 1000);
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS + 1000 + t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+
+    at(t.QUESTION_NOTICE_DELAY_MS + t.QUESTION_NOTICE_MIN_GAP_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(2);
+    expect(text(sent[1])).toContain(second.id);
+  });
+
+  it("never announces a session that went back to running before the hold-down ended", async () => {
+    const t = await load();
+    const job = addJob(t);
+    t.pollRunningJobs();
+    expect(job.status).toBe("needs_input");
+
+    writeFileSync(t.stateFilePath(job.id), "running");
+    at(5000);
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS + 1000);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(0);
+  });
+
+  it("announces a second, separate question after the session answered the first", async () => {
+    const t = await load();
+    const job = addJob(t);
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+
+    writeFileSync(t.stateFilePath(job.id), "running");
+    at(t.QUESTION_NOTICE_DELAY_MS + 1000);
+    t.pollRunningJobs();
+    writeFileSync(t.stateFilePath(job.id), "idle");
+    at(t.QUESTION_NOTICE_DELAY_MS + 2000);
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS + 2000 + t.QUESTION_NOTICE_MIN_GAP_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(2);
+  });
+
+  it("does not re-announce after a restart while the marker file is present", async () => {
+    const t = await load();
+    const job = addJob(t);
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(existsSync(t.questionNoticeMarkerPath(job.id))).toBe(true);
+
+    // A restarted API process knows nothing about the earlier announcement.
+    delete job.questionSince;
+    delete job.questionNoticeDone;
+    at(t.QUESTION_NOTICE_DELAY_MS + t.QUESTION_NOTICE_MIN_GAP_MS * 2);
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS * 2 + t.QUESTION_NOTICE_MIN_GAP_MS * 2);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+  });
+
+  it("stays silent for an idle session and for a permission prompt", async () => {
+    const t = await load();
+    const idle = addJob(t);
+    waiting.delete(idle.id);
+    const prompt = addJob(t);
+    waiting.delete(prompt.id);
+    // A permission dialog is shown while the Stop hook has not fired.
+    writeFileSync(t.stateFilePath(prompt.id), "running");
+    panes.set(prompt.tmuxSession, "Do you want to proceed?\n❯ 1. Yes\n  2. No");
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS * 2);
+    t.pollRunningJobs();
+
+    expect(idle.status).toBe("idle");
+    expect(prompt.status).toBe("needs_input");
+    expect(prompt.needsInputReason).toBe("permission");
+    expect(sent).toHaveLength(0);
+  });
+
+  it("does not type over a draft, and delivers on a later poll once the prompt is empty", async () => {
+    const t = await load();
+    addJob(t);
+    supervisorPane = box("half a sentence");
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(0);
+
+    supervisorPane = box();
+    at(t.QUESTION_NOTICE_DELAY_MS + 2000);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+  });
+
+  it("gives up after a bounded number of attempts when the supervisor never frees up", async () => {
+    const t = await load();
+    const job = addJob(t);
+    supervisorPane = "Do you want to proceed?\n❯ 1. Yes";
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
+    t.pollRunningJobs();
+    for (let i = 0; i < t.NOTICE_MAX_ATTEMPTS + 10; i += 1) {
+      at(t.QUESTION_NOTICE_DELAY_MS + i * 2000);
+      t.pollRunningJobs();
+    }
+    expect(sent).toHaveLength(0);
+    expect(job.questionNoticeDone).toBe(true);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
+  });
+
+  it("gives an id with path characters no marker path, and never names it in a notice", async () => {
+    const t = await load();
+    expect(t.questionNoticeMarkerPath("../../etc/passwd")).toBeNull();
+    const odd = addJob(t);
+    t.jobs.delete(odd.id);
+    odd.id = "bad id; rm -rf";
+    t.jobs.set(odd.id, odd);
+    waiting.add(odd.id);
+    files.push(t.stateFilePath(odd.id));
+    writeFileSync(t.stateFilePath(odd.id), "idle");
+    t.pollRunningJobs();
+    expect(odd.status).toBe("needs_input");
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(0);
+  });
+
+  it("announces a new question even though no poll saw the session leave the state", async () => {
+    const t = await load();
+    const job = addJob(t);
+    turns.set(job.id, "msg_1");
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+
+    // The user answered and the agent asked again inside one poll interval, so
+    // the status never left needs_input. It is held down again like a new one.
+    turns.set(job.id, "msg_2");
+    at(t.QUESTION_NOTICE_DELAY_MS + 1000);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+
+    at(t.QUESTION_NOTICE_DELAY_MS + 1000 + t.QUESTION_NOTICE_MIN_GAP_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(2);
+  });
+
+  it("announces a question whose marker on disk is for an earlier question, as after an API restart", async () => {
+    const t = await load();
+    const job = addJob(t);
+    turns.set(job.id, "msg_2");
+    writeFileSync(t.questionNoticeMarkerPath(job.id), "notified turn=msg_1 2026-11-19T00:00:00.000Z\n");
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+  });
+
+  it("keeps a marker another process wrote for the question this one is only now seeing", async () => {
+    const t = await load();
+    const job = addJob(t);
+    turns.set(job.id, "msg_1");
+    t.pollRunningJobs();
+
+    // Another API process announced msg_2 before this one polled it.
+    writeFileSync(t.questionNoticeMarkerPath(job.id), "notified turn=msg_2 2026-11-19T00:00:00.000Z\n");
+    turns.set(job.id, "msg_2");
+    at(1000);
+    t.pollRunningJobs();
+    expect(existsSync(t.questionNoticeMarkerPath(job.id))).toBe(true);
+
+    at(1000 + t.QUESTION_NOTICE_DELAY_MS + t.QUESTION_NOTICE_MIN_GAP_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(0);
+  });
+
+  it("replaces a marker for an earlier question when it announces the new one", async () => {
+    const t = await load();
+    const job = addJob(t);
+    turns.set(job.id, "msg_2");
+    writeFileSync(t.questionNoticeMarkerPath(job.id), "notified turn=msg_1 2026-11-19T00:00:00.000Z\n");
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+    expect(readFileSync(t.questionNoticeMarkerPath(job.id), "utf-8")).toContain("turn=msg_2");
+  });
+
+  it("does not announce a question whose marker on disk is for the same question", async () => {
+    const t = await load();
+    const job = addJob(t);
+    turns.set(job.id, "msg_1");
+    writeFileSync(t.questionNoticeMarkerPath(job.id), "notified turn=msg_1 2026-11-19T00:00:00.000Z\n");
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(0);
+  });
+
+  it("leaves the notice to another process that holds the lock, and takes over a stale lock", async () => {
+    const t = await load();
+    addJob(t);
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    writeFileSync(t.questionNoticeLockPath, String(T0 + t.QUESTION_NOTICE_DELAY_MS));
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(0);
+    // Holding the lock must not use up the job's delivery attempts.
+    expect([...t.jobs.values()].every((j) => !j.questionNoticeAttempts)).toBe(true);
+
+    // The holder died: its lock is older than any delivery could take.
+    at(t.QUESTION_NOTICE_DELAY_MS + t.QUESTION_LOCK_STALE_MS + 1000);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+  });
+
+  it("releases the lock once it has delivered, or failed to", async () => {
+    const t = await load();
+    addJob(t);
+    supervisorPane = box("half a sentence");
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(existsSync(t.questionNoticeLockPath)).toBe(false);
+
+    supervisorPane = box();
+    at(t.QUESTION_NOTICE_DELAY_MS + 2000);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+    expect(existsSync(t.questionNoticeLockPath)).toBe(false);
+  });
+
+  it("records when it sent, where another process can read it", async () => {
+    const t = await load();
+    addJob(t);
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(readFileSync(t.questionNoticeLastPath, "utf-8")).toBe(String(T0 + t.QUESTION_NOTICE_DELAY_MS));
+  });
+
+  it("honours a notice another process sent a moment ago", async () => {
+    const t = await load();
+    addJob(t);
+    writeFileSync(t.questionNoticeLastPath, String(T0 + t.QUESTION_NOTICE_DELAY_MS - 10_000));
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(0);
+
+    at(t.QUESTION_NOTICE_DELAY_MS - 10_000 + t.QUESTION_NOTICE_MIN_GAP_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+  });
+
+  it("is not silenced by a last-notice time in the future", async () => {
+    const t = await load();
+    addJob(t);
+    writeFileSync(t.questionNoticeLastPath, String(T0 + 10 * 24 * 60 * 60 * 1000));
+    t.pollRunningJobs();
+    at(t.QUESTION_NOTICE_DELAY_MS);
+    t.pollRunningJobs();
+    expect(sent).toHaveLength(1);
+  });
+
+  it("words a single session in the singular", async () => {
+    const t = await load();
+    const line = t.questionNotice([{ id: "abc-1", ticketKey: null }]);
+    expect(line).toContain("1 agent session has stopped and is waiting");
+    expect(line).toContain("its terminal");
+  });
+
+  it("does not expose the notice bookkeeping through serializeJob", async () => {
+    await load();
+    const mod = await import("../api/run-command.js");
+    const out = mod.serializeJob({
+      id: "abc",
+      status: "needs_input",
+      questionSince: 1,
+      questionTurn: "msg_1",
+      needsInputTurn: "msg_1",
+      questionNoticeDone: true,
+      questionNoticeAttempts: 2,
+      log: "",
+    });
+    expect(out).not.toHaveProperty("questionTurn");
+    expect(out).not.toHaveProperty("needsInputTurn");
+    expect(out).not.toHaveProperty("questionSince");
+    expect(out).not.toHaveProperty("questionNoticeDone");
+    expect(out).not.toHaveProperty("questionNoticeAttempts");
   });
 });

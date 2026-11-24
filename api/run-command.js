@@ -18,6 +18,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  statSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -36,6 +37,7 @@ import {
   findTranscript,
   inferAwaiting,
   inputBoxIsEmpty,
+  QUIET_MS,
   readTranscriptTail,
   relayIfUndelivered,
   TMUX_TIMEOUT_MS,
@@ -133,16 +135,18 @@ function connectionError(paneText) {
 // no pane signal either: UserPromptSubmit writes "running" and this stops being
 // asked. It reuses needs_input, with `reason` saying which kind, so every
 // consumer of that status keeps working.
+//
+// `turn` identifies which assistant message a question came from, so a job that
+// asks a second question is not mistaken for the first one (see trackQuestion).
 function resolveLiveState({ mode, paneText, hookState, awaiting = null }) {
-  if (connectionError(paneText)) return { status: "connection_error", reason: null, note: null };
+  const state = (status, reason = null, note = null, turn = null) => ({ status, reason, note, turn });
+  if (connectionError(paneText)) return state("connection_error");
   if (mode === "interactive" && hookState === "idle") {
-    if (hasMenuCursor(paneText)) return { status: "needs_input", reason: "permission", note: null };
-    if (awaiting) return { status: "needs_input", reason: "question", note: awaiting.note ?? null };
-    return { status: "idle", reason: null, note: null };
+    if (hasMenuCursor(paneText)) return state("needs_input", "permission");
+    if (awaiting) return state("needs_input", "question", awaiting.note ?? null, awaiting.turn ?? null);
+    return state("idle");
   }
-  return needsInput(paneText)
-    ? { status: "needs_input", reason: "permission", note: null }
-    : { status: "running", reason: null, note: null };
+  return needsInput(paneText) ? state("needs_input", "permission") : state("running");
 }
 
 function resolveLiveStatus(args) {
@@ -544,8 +548,245 @@ function writeMarker(path, content) {
   }
 }
 
+// A session that stopped waiting on the user's reply (needs_input, reason
+// "question") is announced to the supervisor like a connection error is, with
+// two differences. Many sessions can stop at once (a batch finishing), and each
+// notice is a turn the supervisor has to take, so the sessions that are due are
+// folded into one line that names at most a few of them. And the line is held
+// back briefly and rate-limited, so a Stop-hook continuation that flips the
+// session straight back to running is never announced, and sessions trickling
+// in cannot become a stream of lines.
+//
+// Two API processes (DASHBOARD_PORT allows it) must not both announce the same
+// question or each keep their own rate limit, so the part that decides and
+// sends runs under a lock file, rechecks the markers once it holds it, and
+// reads the time of the last notice from a file both processes share.
+const QUESTION_NOTICE_DELAY_MS = QUIET_MS;
+const QUESTION_NOTICE_MIN_GAP_MS = 60_000;
+const QUESTION_NOTICE_MAX_IDS = 5;
+// A sender holds the lock for one tmux round trip (a few seconds at most), so
+// a lock older than this belongs to a process that died holding it.
+const QUESTION_LOCK_STALE_MS = 30_000;
+let lastQuestionNoticeSent = 0;
+
+function questionNoticeMarkerPath(id) {
+  return SAFE_ID.test(id) ? join(JOBS_DIR, `${id}.needs-input-notice`) : null;
+}
+
+const questionNoticeLastPath = join(JOBS_DIR, "question-notice.last");
+const questionNoticeLockPath = join(JOBS_DIR, "question-notice.lock");
+
+// The marker says which assistant message the announced question came from, so
+// a later question from the same session is a new one even when no poll saw the
+// session leave the state in between (a quick reply, or the API being down).
+function questionMarkerTurn(path) {
+  try {
+    const match = /turn=(\S+)/.exec(readFileSync(path, "utf-8"));
+    return match && match[1] !== "-" ? match[1] : null;
+  } catch {
+    return null;
+  }
+}
+
+// True when the marker on disk is for the question the job is waiting on now.
+// Without an identity on either side there is nothing to tell them apart by,
+// and the marker counts, which is how a job without a transcript id behaves.
+function markerIsForCurrentQuestion(marker, job) {
+  const turn = job.needsInputTurn ?? null;
+  const marked = questionMarkerTurn(marker);
+  return turn === null || marked === null || marked === turn;
+}
+
+function writeQuestionMarker(job, label) {
+  const path = questionNoticeMarkerPath(job.id);
+  if (!path) return;
+  try {
+    writeFileSync(path, `${label} turn=${job.needsInputTurn ?? "-"} ${new Date().toISOString()}\n`, "utf-8");
+  } catch {
+    // Dedupe across an API restart is lost; within this process the job's
+    // questionNoticeDone flag still holds.
+  }
+}
+
+function removeQuietly(path) {
+  try {
+    unlinkSync(path);
+  } catch {
+    // Best-effort; worst case a later question is not announced.
+  }
+}
+
+function readLastQuestionNoticeAt() {
+  try {
+    const value = Number.parseInt(readFileSync(questionNoticeLastPath, "utf-8"), 10);
+    return Number.isFinite(value) ? value : 0;
+  } catch {
+    return 0;
+  }
+}
+
+// Runs `fn` while holding the lock file; skips this poll when another process
+// holds it. Returns whether `fn` ran. A lock that cannot be created for any
+// other reason (jobs dir gone, disk full) does not stop the notice: that is the
+// same best-effort stance the markers take.
+function withQuestionLock(now, fn) {
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      writeFileSync(questionNoticeLockPath, String(now), { flag: "wx" });
+      break;
+    } catch (err) {
+      if (err.code !== "EEXIST") {
+        fn();
+        return true;
+      }
+      let heldAt = Number.NaN;
+      try {
+        heldAt = Number.parseInt(readFileSync(questionNoticeLockPath, "utf-8"), 10);
+        if (!Number.isFinite(heldAt)) heldAt = statSync(questionNoticeLockPath).mtimeMs;
+      } catch {
+        // Gone already: the next attempt takes it.
+      }
+      if (Number.isFinite(heldAt) && Math.abs(now - heldAt) <= QUESTION_LOCK_STALE_MS) return false;
+      removeQuietly(questionNoticeLockPath);
+      if (attempt === 1) return false;
+    }
+  }
+  try {
+    fn();
+  } finally {
+    removeQuietly(questionNoticeLockPath);
+  }
+  return true;
+}
+
+function isWaitingOnReply(job) {
+  return job.status === "needs_input" && job.needsInputReason === "question";
+}
+
+// Fixed text plus job ids and Jira-shaped ticket keys. The agent's note and the
+// job title are left out for the same reason as in connectionErrorNotice: this
+// line is typed into the supervisor as if the user had written it.
+function questionNotice(batch) {
+  const shown = batch.slice(0, QUESTION_NOTICE_MAX_IDS).map((job) => {
+    const ticket = job.ticketKey && TICKET_KEY.test(job.ticketKey) ? ` (${job.ticketKey})` : "";
+    return `${job.id}${ticket}`;
+  });
+  const more =
+    batch.length > shown.length ? ` and ${batch.length - shown.length} more (list them with GET /api/jobs)` : "";
+  const one = batch.length === 1;
+  return (
+    `${NOTICE_TAG} ${batch.length} agent ${one ? "session has" : "sessions have"} stopped and ` +
+    `${one ? "is" : "are"} waiting for the user's reply (job status needs_input, needsInputReason question): ` +
+    `${shown.join(", ")}${more}. Tell the user, and offer to open ${one ? "its terminal" : "their terminals"} ` +
+    `(POST /api/jobs/<id>/open-terminal) so they can answer. This is a one-time notice, so don't poll for it.`
+  );
+}
+
+// Per job, every poll: when it entered the state, which question it is, and
+// whether that question was already announced (kept on disk too, so an API
+// restart does not announce it again). All of it resets as soon as the job
+// leaves the state. It also resets when the question changes without a poll
+// having seen the job leave: the user answered and the agent asked again
+// within one poll interval, or while the API was down.
+function trackQuestion(job, now) {
+  const marker = questionNoticeMarkerPath(job.id);
+
+  if (!isWaitingOnReply(job)) {
+    job.questionSince = null;
+    job.questionTurn = undefined;
+    job.questionNoticeDone = false;
+    job.questionNoticeAttempts = 0;
+    // existsSync first: this runs for every live job on every poll, and
+    // almost always there is nothing to remove.
+    if (marker && existsSync(marker)) removeQuietly(marker);
+    return;
+  }
+
+  const turn = job.needsInputTurn ?? null;
+  if (job.questionSince == null) {
+    job.questionSince = now;
+  } else if (job.questionTurn !== turn) {
+    job.questionSince = now;
+    job.questionNoticeDone = false;
+    job.questionNoticeAttempts = 0;
+  }
+  job.questionTurn = turn;
+
+  // A marker is never deleted here, only read: another process may have just
+  // written one for the question this process is only now seeing. A marker for
+  // an earlier question is replaced when the new one is sent.
+  if (!job.questionNoticeDone && marker && existsSync(marker) && markerIsForCurrentQuestion(marker, job)) {
+    job.questionNoticeDone = true;
+  }
+}
+
+function announceQuestions(now) {
+  const due = [...jobs.values()]
+    .filter(
+      (job) =>
+        isLive(job.status) &&
+        isWaitingOnReply(job) &&
+        !job.questionNoticeDone &&
+        job.questionSince != null &&
+        now - job.questionSince >= QUESTION_NOTICE_DELAY_MS,
+    )
+    .sort((a, b) => a.questionSince - b.questionSince);
+  if (due.length === 0) return;
+
+  withQuestionLock(now, () => deliverQuestions(now, due));
+}
+
+// Runs under the lock. Everything it decides on is read again here, because
+// another process may have announced or rate-limited since this poll started.
+function deliverQuestions(now, due) {
+  // A last notice time in the future means the clock moved (or the file is
+  // stale); it cannot be a reason to stay silent.
+  const sinceLast = now - Math.max(lastQuestionNoticeSent, readLastQuestionNoticeAt());
+  if (sinceLast >= 0 && sinceLast < QUESTION_NOTICE_MIN_GAP_MS) return;
+
+  const batch = [];
+  for (const job of due) {
+    const marker = questionNoticeMarkerPath(job.id);
+    // An id outside SAFE_ID can't be named in a typed line or given a marker.
+    if (!marker) {
+      job.questionNoticeDone = true;
+    } else if (existsSync(marker) && markerIsForCurrentQuestion(marker, job)) {
+      job.questionNoticeDone = true;
+    } else {
+      batch.push(job);
+    }
+  }
+  if (batch.length === 0) return;
+
+  if (sendNoticeToSupervisor(questionNotice(batch))) {
+    lastQuestionNoticeSent = now;
+    try {
+      writeFileSync(questionNoticeLastPath, String(now), "utf-8");
+    } catch {
+      // The in-memory time still limits this process.
+    }
+    for (const job of batch) {
+      job.questionNoticeDone = true;
+      writeQuestionMarker(job, "notified");
+    }
+    return;
+  }
+
+  // The supervisor is busy or mid-draft; retry on the next poll, for about a
+  // minute, then give up on the job (the dashboard still shows it).
+  for (const job of batch) {
+    job.questionNoticeAttempts = (job.questionNoticeAttempts ?? 0) + 1;
+    if (job.questionNoticeAttempts >= NOTICE_MAX_ATTEMPTS) {
+      console.warn(`needs_input notice for job ${job.id} not delivered; giving up`);
+      job.questionNoticeDone = true;
+      writeQuestionMarker(job, "gave-up");
+    }
+  }
+}
+
 function pollRunningJobs() {
   syncJobsFromTmux();
+  const now = Date.now();
 
   for (const job of jobs.values()) {
     if (!isLive(job.status)) continue;
@@ -589,15 +830,19 @@ function pollRunningJobs() {
     job.status = state.status;
     job.needsInputReason = state.reason;
     job.needsInputNote = state.note;
+    job.needsInputTurn = state.turn;
     trackConnectionError(job);
+    trackQuestion(job, now);
     // A "running" or "idle" job is relayed: idle is exactly the session that
     // stopped its turn, which is the one that may have ended without reporting
     // (relayIfUndelivered checks the transcript, not this status). Skipping
-    // idle would leave the relay firing only at close. connection_error
-    // already has its own supervisor notice, and needs_input is waiting on a
-    // human.
+    // idle would leave the relay firing only at close. connection_error and a
+    // needs_input question already have their own supervisor notices, and
+    // needs_input is waiting on a human.
     if (job.status === "running" || job.status === "idle") tryRelay(job);
   }
+
+  announceQuestions(now);
 }
 
 syncJobsFromTmux();
@@ -691,9 +936,18 @@ export function startCommandJob({
 // agent actually wrote to it, not whether one exists.
 export function serializeJob(job, { includeLog = false } = {}) {
   if (!job) return null;
-  // noticeAttempts / noticeDone are poller bookkeeping, not part of the job's
-  // API shape.
-  const { log, noticeAttempts, noticeDone, ...rest } = job;
+  // The notice fields are poller bookkeeping, not part of the job's API shape.
+  const {
+    log,
+    noticeAttempts,
+    noticeDone,
+    questionSince,
+    questionTurn,
+    questionNoticeDone,
+    questionNoticeAttempts,
+    needsInputTurn,
+    ...rest
+  } = job;
   const withBrain = { ...rest, hasBrain: hasBrainContent(job.id) };
   return includeLog ? { ...withBrain, log } : withBrain;
 }
@@ -875,6 +1129,7 @@ export function closeJob(id) {
     metaFilePath(id),
     stateFilePath(id),
     connectionErrorMarkerPath(id),
+    questionNoticeMarkerPath(id),
   ].filter(Boolean)) {
     try {
       unlinkSync(path);
@@ -903,6 +1158,14 @@ export const __test__ = {
   connectionError,
   connectionErrorMarkerPath,
   connectionErrorNotice,
+  questionNotice,
+  questionNoticeMarkerPath,
+  questionNoticeLastPath,
+  questionNoticeLockPath,
+  QUESTION_LOCK_STALE_MS,
+  QUESTION_NOTICE_DELAY_MS,
+  QUESTION_NOTICE_MIN_GAP_MS,
+  QUESTION_NOTICE_MAX_IDS,
   pollRunningJobs,
   syncJobsFromTmux,
   supervisorState,
