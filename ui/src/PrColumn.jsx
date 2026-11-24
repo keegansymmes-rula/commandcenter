@@ -7,6 +7,7 @@
 // dispatched agent, so this has no onFocus/focusedContext wiring.
 
 import { useCallback, useEffect, useState } from "react";
+import { pollFetch } from "./pollFetch.js";
 
 const ROLE_LABEL = { author: "mine", assignee: "assigned" };
 
@@ -60,7 +61,9 @@ export function PrColumn() {
 
   const fetchPrs = useCallback(async () => {
     try {
-      const res = await fetch("/api/prs");
+      // Longer than the API's own 30s gh deadline, so a slow GitHub answers
+      // (with whatever it found) instead of being cut off here first.
+      const res = await pollFetch("/api/prs", 35_000);
       const data = await res.json();
       if (!data.ok) {
         setError(data.error);
