@@ -9,6 +9,7 @@
 import { useEffect, useState } from "react";
 import { StatusIcon } from "./StatusIcon.jsx";
 import { isLiveStatus } from "./jobStatus.js";
+import { openTerminal } from "./openTerminal.js";
 
 function useOpenInIterm(jobId) {
   const [state, setState] = useState("idle"); // idle | opening | error
@@ -17,19 +18,13 @@ function useOpenInIterm(jobId) {
   const open = async () => {
     setState("opening");
     setError(null);
-    try {
-      const res = await fetch(`/api/jobs/${jobId}/open-terminal`, { method: "POST" });
-      const data = await res.json();
-      if (!data.ok) {
-        setState("error");
-        setError(data.error);
-        return;
-      }
-      setState("idle");
-    } catch (err) {
+    const result = await openTerminal(jobId);
+    if (!result.ok) {
       setState("error");
-      setError(err.message);
+      setError(result.error);
+      return;
     }
+    setState("idle");
   };
 
   return { state, error, open };
@@ -108,6 +103,11 @@ function SessionCard({ job, onClose }) {
           <span className="session-exit">exit {job.exitCode}</span>
         )}
         {state === "opening" && <span className="session-opening">opening…</span>}
+        {state === "error" && (
+          <span className="session-open-error" title={error}>
+            couldn't open
+          </span>
+        )}
       </button>
       {job.status === "connection_error" && canOpen && (
         <button

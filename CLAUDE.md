@@ -71,6 +71,15 @@ See README.md for setup, architecture, and feature docs.
 - If an older API server still holds port 3789, `npm run dev` serves the UI
   against the stale server and new routes 404. The server prints the
   `lsof`/`kill` recipe on `EADDRINUSE`.
+- If the dashboard intermittently hangs or shows "Failed to fetch" (a click
+  on a session does nothing, `curl localhost:5173` sometimes stalls with
+  connect time 0), check `netstat -an -p tcp | grep -c TIME_WAIT`. On one Mac
+  TIME_WAIT entries were never reaped (4,000+ per port, none expiring),
+  which pins ephemeral ports and stalls any new `::1` connection that draws
+  one. `vite.config.js` keeps the dev proxy on a keep-alive agent and
+  IPv4 loopback so it doesn't add to the pile; a reboot clears what's there.
+  Any loop that opens a fresh connection per request (`curl` in a `while`)
+  adds to it.
 - Push-to-talk must only ever use a local-only Superwhisper mode. See
   `.plans/push-to-talk-wispr.md` before touching `pearl-speak.js` voice
   paths or `hammerspoon/pearl-ptt.lua`.
